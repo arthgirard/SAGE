@@ -2,3 +2,5 @@ numpy
 yfinance
 scipy
 transformers
+ccxt
+pandas
