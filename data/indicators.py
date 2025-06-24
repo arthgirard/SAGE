@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from datetime import datetime, timezone
 from typing import Dict, Final
 
 import ccxt
