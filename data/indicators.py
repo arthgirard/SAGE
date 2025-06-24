@@ -1,16 +1,3 @@
-"""
-SAGE – Solana Analysis & Guidance Engine
-indicators.py
----------------------------------------
-Vectorised implementations of core technical indicators used by SAGE.
-No TA‑Lib dependency; pure NumPy / pandas for portability.
-
-All functions are *side‑effect‑free*: they return new Series/DataFrames and
-never mutate the input.  Missing values are forward‑filled where sensible so
-models don’t choke on NaNs.
-
-Author: Senior Software Engineer (PhD Quant) – June 24 2025
-"""
 from __future__ import annotations
 
 import logging
