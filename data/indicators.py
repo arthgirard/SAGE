@@ -1,144 +1,193 @@
 from __future__ import annotations
 
+import argparse
+import json
 import logging
-from typing import Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Dict, Final
 
+import ccxt
 import numpy as np
 import pandas as pd
 
 __all__ = [
-    "sma",
-    "ema",
-    "rsi",
-    "macd",
-    "bollinger_bands",
-    "atr",
-    "vwap",
-    "add_all_indicators",
+    "fetch_ohlcv",
+    "compute_indicators",
+    "interpret_latest",
+    "compute_score",          # NEW
+    "fetch_and_interpret",
 ]
 
+# ---------------------------------------------------------------------------
+# Configuration & logger
+# ---------------------------------------------------------------------------
+
+_LOG_LEVEL: Final = "INFO"
+logging.basicConfig(
+    level=_LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] %(name)s | %(message)s",
+)
 logger = logging.getLogger("SAGE.Indicators")
 
-# ---------------------------------------------------------------------------
-# Simple / Exponential Moving Averages
-# ---------------------------------------------------------------------------
-
-def sma(series: pd.Series, window: int) -> pd.Series:
-    """Simple Moving Average (SMA)."""
-    return series.rolling(window, min_periods=window).mean().rename(f"SMA_{window}")
-
-
-def ema(series: pd.Series, span: int) -> pd.Series:
-    """Exponential Moving Average (EMA)."""
-    return series.ewm(span=span, adjust=False).mean().rename(f"EMA_{span}")
+EXCHANGE: Final = "binance"
+PAIR: Final = "SOL/USDT"
+TIMEFRAME: Final = "1m"
+LIMIT: Final = 500
 
 # ---------------------------------------------------------------------------
-# Relative Strength Index (RSI)
+# Helpers
 # ---------------------------------------------------------------------------
 
-def rsi(series: pd.Series, window: int = 14) -> pd.Series:
-    """Relative Strength Index (RSI)."""
+
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    roll_up = up.ewm(span=window, adjust=False).mean()
-    roll_down = down.ewm(span=window, adjust=False).mean()
-    rs = roll_up / roll_down
-    rsi_series = 100.0 - (100.0 / (1.0 + rs))
-    return rsi_series.rename(f"RSI_{window}")
+    up = np.where(delta > 0.0, delta, 0.0)
+    dn = np.where(delta < 0.0, -delta, 0.0)
+
+    roll_up = pd.Series(up, index=series.index).rolling(period).mean()
+    roll_dn = pd.Series(dn, index=series.index).rolling(period).mean()
+
+    rs = roll_up / roll_dn.replace(0, np.nan)
+    return 100.0 - (100.0 / (1.0 + rs))
+
 
 # ---------------------------------------------------------------------------
-# Moving Average Convergence Divergence (MACD)
+# 1 · Fetch OHLCV
 # ---------------------------------------------------------------------------
 
-def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
-    """MACD line, signal line, and histogram."""
-    ema_fast = ema(series, fast)
-    ema_slow = ema(series, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    df = pd.DataFrame({
-        f"MACD_{fast}_{slow}": macd_line,
-        f"MACD_signal_{signal}": signal_line,
-        "MACD_hist": hist,
-    })
+
+def fetch_ohlcv(
+    exchange: str = EXCHANGE,
+    pair: str = PAIR,
+    timeframe: str = TIMEFRAME,
+    limit: int = LIMIT,
+) -> pd.DataFrame:
+    client = getattr(ccxt, exchange)({"enableRateLimit": True})
+    raw = client.fetch_ohlcv(pair, timeframe=timeframe, limit=limit)
+    df = pd.DataFrame(
+        raw, columns=["timestamp", "open", "high", "low", "close", "volume"]
+    )
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df.set_index("timestamp", inplace=True)
+    return df.astype(float)
+
+
+# ---------------------------------------------------------------------------
+# 2 · Compute indicators
+# ---------------------------------------------------------------------------
+
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        raise ValueError("DataFrame empty – cannot compute indicators")
+
+    df["sma20"] = df["close"].rolling(20).mean()
+    df["sma50"] = df["close"].rolling(50).mean()
+
+    df["ema12"] = _ema(df["close"], 12)
+    df["ema26"] = _ema(df["close"], 26)
+
+    df["macd"] = df["ema12"] - df["ema26"]
+    df["macd_signal"] = _ema(df["macd"], 9)
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
+
+    df["rsi14"] = _rsi(df["close"], 14)
+
+    df["bb_mid"] = df["close"].rolling(20).mean()
+    df["bb_std"] = df["close"].rolling(20).std()
+    df["bb_upper"] = df["bb_mid"] + 2 * df["bb_std"]
+    df["bb_lower"] = df["bb_mid"] - 2 * df["bb_std"]
+    df["bb_percent"] = (df["close"] - df["bb_lower"]) / (
+        df["bb_upper"] - df["bb_lower"]
+    )
+
+    vol_mean = df["volume"].rolling(30).mean()
+    vol_std = df["volume"].rolling(30).std()
+    df["vol_z"] = (df["volume"] - vol_mean) / vol_std.replace(0, np.nan)
+
     return df
 
-# ---------------------------------------------------------------------------
-# Bollinger Bands
-# ---------------------------------------------------------------------------
-
-def bollinger_bands(series: pd.Series, window: int = 20, n_std: float = 2.0) -> pd.DataFrame:
-    """Return upper, middle, and lower Bollinger Bands."""
-    mid = sma(series, window)
-    std = series.rolling(window, min_periods=window).std()
-    upper = mid + n_std * std
-    lower = mid - n_std * std
-    return pd.DataFrame({
-        f"BB_upper_{window}": upper,
-        f"BB_mid_{window}": mid,
-        f"BB_lower_{window}": lower,
-    })
 
 # ---------------------------------------------------------------------------
-# Average True Range (ATR)
+# 3 · Interpret latest candle → feature vector
 # ---------------------------------------------------------------------------
 
-def atr(ohlc: pd.DataFrame, window: int = 14) -> pd.Series:
-    """Average True Range (ATR).  Expects columns: high, low, close."""
-    high = ohlc["high"].astype(float)
-    low = ohlc["low"].astype(float)
-    close = ohlc["close"].astype(float)
 
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    atr_series = tr.ewm(span=window, adjust=False).mean()
-    return atr_series.rename(f"ATR_{window}")
+def interpret_latest(df: pd.DataFrame) -> Dict[str, float]:
+    row = df.iloc[-1]
 
-# ---------------------------------------------------------------------------
-# Volume‑Weighted Average Price (VWAP)
-# ---------------------------------------------------------------------------
+    rsi_state = 1.0 if row["rsi14"] > 70 else (-1.0 if row["rsi14"] < 30 else 0.0)
+    macd_state = 1.0 if row["macd"] > row["macd_signal"] else -1.0
+    price_sma_state = 1.0 if row["close"] > row["sma20"] else -1.0
 
-def vwap(ohlc: pd.DataFrame) -> pd.Series:
-    """Cumulative intraday VWAP. Requires columns: high, low, close, volume."""
-    price = (ohlc["high"] + ohlc["low"] + ohlc["close"]) / 3.0
-    vol = ohlc["volume"].astype(float)
-    cum_vol_price = (price * vol).cumsum()
-    cum_vol = vol.cumsum()
-    return (cum_vol_price / cum_vol).rename("VWAP")
+    return {
+        "price": row["close"],
+        "rsi14": row["rsi14"],
+        "macd_hist": row["macd_hist"],
+        "bb_percent": row["bb_percent"],
+        "vol_z": row["vol_z"],
+        "rsi_state": rsi_state,
+        "macd_state": macd_state,
+        "price_vs_sma20": price_sma_state,
+        "timestamp": row.name.timestamp(),
+    }
 
-# ---------------------------------------------------------------------------
-# Convenience – add all core indicators to a DataFrame
-# ---------------------------------------------------------------------------
 
-def add_all_indicators(df: pd.DataFrame, *, price_col: str = "close") -> pd.DataFrame:
-    """Return *df* plus a standard set of indicators for *price_col*.
-
-    The function does **not** mutate *df*; a new DataFrame is returned.
-    Missing OHLC columns for ATR/VWAP are ignored gracefully.
+# 3.5 · Composite score  (NEW)
+def compute_score(feats: Dict[str, float]) -> float:
     """
-    price = df[price_col].astype(float)
+    Simple sentiment score in [-1, +1].
 
-    indicators: List[pd.DataFrame | pd.Series] = [
-        sma(price, 20),
-        ema(price, 50),
-        ema(price, 200),
-        rsi(price, 14),
-        macd(price),
-        bollinger_bands(price),
+    Current definition = mean of the three discrete states.
+    Adapt/weight as you refine the edge.
+    """
+    states = [
+        feats.get("rsi_state", 0.0),
+        feats.get("macd_state", 0.0),
+        feats.get("price_vs_sma20", 0.0),
     ]
+    return float(sum(states)) / len(states)
 
-    if {"high", "low", "close"}.issubset(df.columns):
-        indicators.append(atr(df))
-    if {"high", "low", "close", "volume"}.issubset(df.columns):
-        indicators.append(vwap(df))
 
-    combined = pd.concat([df.copy()] + indicators, axis=1)
-    combined.fillna(method="ffill", inplace=True)
-    combined.fillna(method="bfill", inplace=True)
-    return combined
+# Convenience wrapper
+def fetch_and_interpret(
+    timeframe: str = TIMEFRAME,
+    limit: int = LIMIT,
+) -> Dict[str, float]:
+    df = fetch_ohlcv(timeframe=timeframe, limit=limit)
+    df = compute_indicators(df)
+    return interpret_latest(df)
+
+
+# ---------------------------------------------------------------------------
+# 4 · CLI
+# ---------------------------------------------------------------------------
+
+
+def _cli() -> None:
+    cli = argparse.ArgumentParser(description="SAGE – Solana indicators")
+    cli.add_argument("--timeframe", default=TIMEFRAME, help="ccxt timeframe (e.g. 1m)")
+    cli.add_argument("--limit", type=int, default=LIMIT, help="candles to fetch")
+    cli.add_argument(
+        "--json-min",
+        action="store_true",
+        help="print minified JSON (good for piping)",
+    )
+    args = cli.parse_args()
+
+    feats = fetch_and_interpret(timeframe=args.timeframe, limit=args.limit)
+    score = compute_score(feats)               # NEW
+    logger.info("Composite signal score = %.3f", score)   # NEW
+
+    if args.json_min:
+        print(json.dumps(feats, separators=(",", ":")))
+    else:
+        print(json.dumps(feats, indent=2, default=float))
+
+
+if __name__ == "__main__":
+    _cli()
