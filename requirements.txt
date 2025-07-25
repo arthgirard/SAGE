@@ -1,6 +1,11 @@
-numpy
-yfinance
-scipy
-transformers
-ccxt
-pandas
+ccxt==4.1.30
+pandas==2.1.3
+numpy==1.25.2
+scikit-learn==1.3.2
+asyncio
+logging
+pickle
+argparse
+json
+os
+datetime
