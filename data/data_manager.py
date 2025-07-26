@@ -1,4 +1,4 @@
-# data_manager.py
+# data/data_manager.py
 """Data management for SOL trading"""
 
 import pandas as pd
@@ -8,6 +8,11 @@ import asyncio
 from datetime import datetime, timedelta
 import pickle
 import os
+import sys
+
+# Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from utilities.config import config
 from utilities.logger import logger
 
@@ -21,6 +26,11 @@ class DataManager:
         
     async def initialize(self):
         """Initialize exchange connection"""
+        if config.MODE == 'backtest':
+            # No need for exchange connection in backtest mode
+            logger.info('Data manager initialized for backtest mode')
+            return
+            
         self.exchange = ccxt.binance({
             'apiKey': config.BINANCE_API_KEY,
             'secret': config.BINANCE_API_SECRET,
@@ -28,9 +38,8 @@ class DataManager:
             'enableRateLimit': True,
         })
         
-        if config.MODE != 'backtest':
-            await self.exchange.load_markets()
-            logger.info('Data manager initialized')
+        await self.exchange.load_markets()
+        logger.info('Data manager initialized')
     
     async def fetch_historical_data(self, days_back=30):
         """Fetch historical SOL data"""
@@ -149,8 +158,28 @@ class DataManager:
         df['low_20'] = df['low'].rolling(20).min()
         df['price_position'] = (df['close'] - df['low_20']) / (df['high_20'] - df['low_20'])
         
-        self.features = df.dropna()
+        # Fill NaN values with forward fill, then backward fill
+        df = df.fillna(method='ffill').fillna(method='bfill')
+        
+        # If still NaN, fill with neutral values
+        df['rsi'] = df['rsi'].fillna(50.0)
+        df['macd'] = df['macd'].fillna(0.0)
+        df['macd_histogram'] = df['macd_histogram'].fillna(0.0)
+        df['bb_position'] = df['bb_position'].fillna(0.5)
+        df['volume_ratio'] = df['volume_ratio'].fillna(1.0)
+        df['price_change_1h'] = df['price_change_1h'].fillna(0.0)
+        df['price_change_4h'] = df['price_change_4h'].fillna(0.0)
+        df['price_change_24h'] = df['price_change_24h'].fillna(0.0)
+        df['volatility'] = df['volatility'].fillna(0.02)
+        df['price_position'] = df['price_position'].fillna(0.5)
+        
+        self.features = df
         logger.info(f'Calculated technical indicators for {len(self.features)} periods')
+        
+        # Debug: Show available columns
+        logger.info(f'Available feature columns: {list(self.features.columns)}')
+        logger.info(f'First few rows of features:')
+        logger.info(f'{self.features.head(3)}')
     
     def get_latest_features(self):
         """Get latest feature vector for prediction"""
@@ -158,6 +187,10 @@ class DataManager:
             return None
         
         latest = self.features.iloc[-1]
+        return self._extract_simple_features(latest)
+    
+    def _extract_simple_features(self, row):
+        """Extract simple feature vector from a data row"""
         feature_names = [
             'rsi', 'macd', 'macd_histogram', 'bb_position', 'volume_ratio',
             'price_change_1h', 'price_change_4h', 'price_change_24h',
@@ -166,29 +199,30 @@ class DataManager:
         
         features = []
         for name in feature_names:
-            if name in latest:
-                features.append(latest[name])
+            if name in row and not pd.isna(row[name]):
+                features.append(float(row[name]))
             else:
                 features.append(0.0)
         
         # Add price ratios
+        close_price = row.get('close', 20.0)
+        sma_20 = row.get('sma_20', close_price)
+        sma_50 = row.get('sma_50', close_price)
+        
         features.extend([
-            latest['close'] / latest['sma_20'] if latest['sma_20'] > 0 else 1.0,
-            latest['close'] / latest['sma_50'] if latest['sma_50'] > 0 else 1.0,
-            latest['sma_20'] / latest['sma_50'] if latest['sma_50'] > 0 else 1.0,
+            close_price / sma_20 if sma_20 > 0 else 1.0,
+            close_price / sma_50 if sma_50 > 0 else 1.0,
+            sma_20 / sma_50 if sma_50 > 0 else 1.0,
         ])
         
         return np.array(features)
     
     def get_training_data(self, lookback=None):
-        """Get training data for ML model"""
-        if lookback is None:
-            lookback = config.LOOKBACK_PERIODS
-        
-        if len(self.features) < lookback + 1:
+        """Get training data for ML model - simplified version"""
+        if self.features.empty:
             return None, None
         
-        # Prepare features
+        # Use simple features instead of complex lookback
         feature_names = [
             'rsi', 'macd', 'macd_histogram', 'bb_position', 'volume_ratio',
             'price_change_1h', 'price_change_4h', 'price_change_24h',
@@ -198,42 +232,25 @@ class DataManager:
         X = []
         y = []
         
-        for i in range(lookback, len(self.features)):
-            # Features from current and past periods
-            current_features = []
-            
-            for j in range(lookback):
-                row = self.features.iloc[i - lookback + j]
-                period_features = []
-                
-                for name in feature_names:
-                    if name in row:
-                        period_features.append(row[name])
-                    else:
-                        period_features.append(0.0)
-                
-                current_features.extend(period_features)
-            
-            # Add current ratios
+        # Skip first 50 rows to ensure all indicators are calculated
+        for i in range(50, len(self.features) - 1):
             current_row = self.features.iloc[i]
-            current_features.extend([
-                current_row['close'] / current_row['sma_20'] if current_row['sma_20'] > 0 else 1.0,
-                current_row['close'] / current_row['sma_50'] if current_row['sma_50'] > 0 else 1.0,
-                current_row['sma_20'] / current_row['sma_50'] if current_row['sma_50'] > 0 else 1.0,
-            ])
+            next_row = self.features.iloc[i + 1]
             
-            X.append(current_features)
+            # Extract features for current row
+            features = self._extract_simple_features(current_row)
+            X.append(features)
             
-            # Target: price change in next period
-            if i < len(self.features) - 1:
-                future_price = self.features.iloc[i + 1]['close']
-                current_price = self.features.iloc[i]['close']
-                price_change = (future_price - current_price) / current_price
-                
-                # Convert to classification: 1 for up, 0 for down
-                y.append(1 if price_change > 0.001 else 0)  # 0.1% threshold
-            else:
-                y.append(0)
+            # Target: price direction in next period
+            current_price = current_row['close']
+            next_price = next_row['close']
+            price_change = (next_price - current_price) / current_price
+            
+            # Binary classification: 1 for up, 0 for down
+            y.append(1 if price_change > 0.001 else 0)  # 0.1% threshold
+        
+        if len(X) == 0:
+            return None, None
         
         return np.array(X), np.array(y)
     
@@ -241,8 +258,13 @@ class DataManager:
         """Get current SOL price"""
         try:
             if config.MODE == 'backtest':
-                return self.features.iloc[-1]['close']
+                if not self.features.empty:
+                    return self.features.iloc[-1]['close']
+                else:
+                    return 20.0  # Default price for testing
             else:
+                if self.exchange is None:
+                    return None
                 ticker = await self.exchange.fetch_ticker(config.SYMBOL)
                 return ticker['last']
         except Exception as e:
