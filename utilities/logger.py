@@ -28,7 +28,7 @@ def log_trade(action, price, amount, balance, pnl=None, confidence=None):
 
 def log_prediction(signal, confidence, features_summary):
     """Log ML prediction"""
-    logger.info(f'PREDICTION | {signal} | Confidence: {confidence:.3f} | Features: {features_summary}')
+    logger.info(f'PREDICTION : {signal} | Confidence: {confidence:.3f} | Features: {features_summary}')
 
 def log_performance(total_trades, win_rate, total_pnl, max_drawdown):
     """Log performance metrics"""
