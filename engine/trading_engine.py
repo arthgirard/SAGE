@@ -1,4 +1,4 @@
-# trading_engine.py
+# engine/trading_engine.py
 """Trading engine for SOL with backtest, paper, and live trading"""
 
 import ccxt
@@ -8,11 +8,15 @@ import numpy as np
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import List, Optional
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utilities.config import config
 from utilities.logger import logger, log_trade, log_performance, log_backtest_result
-from data.data_manager import data_manager
-from engine.ml_predictor import ml_predictor
+# Import ml_predictor only when needed to avoid circular imports
 
 @dataclass
 class Trade:
@@ -409,15 +413,23 @@ class TradingEngine:
         
         # Run backtest loop
         processed_trades = 0
+        signal_counts = {'BUY': 0, 'SELL': 0, 'HOLD': 0}
+        confidence_sum = 0
+        prediction_count = 0
+        
+        logger.info(f'Starting backtest loop from index {config.LOOKBACK_PERIODS} to {len(backtest_data)}')
+        
         for i in range(config.LOOKBACK_PERIODS, len(backtest_data)):
             self.backtest_index = i
             current_data = backtest_data.iloc[i]
             current_price = current_data['close']
             
-            # Progress logging
+            # Progress logging with signal stats
             if i % 1000 == 0:
                 progress = (i - config.LOOKBACK_PERIODS) / (len(backtest_data) - config.LOOKBACK_PERIODS) * 100
-                logger.info(f'Backtest progress: {progress:.1f}% - Price: ${current_price:.4f}')
+                avg_conf = confidence_sum / prediction_count if prediction_count > 0 else 0
+                logger.info(f'Progress: {progress:.1f}% - Price: ${current_price:.4f} - Avg Conf: {avg_conf:.3f}')
+                logger.info(f'Signals: BUY:{signal_counts["BUY"]} SELL:{signal_counts["SELL"]} HOLD:{signal_counts["HOLD"]}')
             
             # Get features for prediction
             features = self._get_backtest_features(backtest_data, i)
@@ -425,16 +437,31 @@ class TradingEngine:
                 # Make prediction
                 signal, confidence = ml_predictor.predict(features)
                 
+                # Track signal statistics
+                signal_counts[signal] += 1
+                confidence_sum += confidence
+                prediction_count += 1
+                
+                # Debug first few predictions
+                if i < config.LOOKBACK_PERIODS + 10:
+                    logger.info(f'Prediction {i}: {signal} (conf: {confidence:.3f}, threshold: {config.PREDICTION_THRESHOLD})')
+                
                 # Check stop loss/take profit first
                 if self.position:
                     stop_triggered = self._check_stop_loss_take_profit_sync(current_price)
                     if stop_triggered:
                         processed_trades += 1
+                        logger.info(f'Position closed by stop/profit at ${current_price:.4f}')
                         continue
                 
                 # Execute signal
-                if self._execute_signal_sync(signal, confidence, current_price):
+                executed = self._execute_signal_sync(signal, confidence, current_price)
+                if executed:
                     processed_trades += 1
+                    logger.info(f'Trade executed: {signal} at ${current_price:.4f} with confidence {confidence:.3f}')
+            else:
+                if i < config.LOOKBACK_PERIODS + 5:
+                    logger.warning(f'No features available for index {i}')
             
             # Record equity curve every 24 periods
             if i % 24 == 0:
@@ -446,10 +473,20 @@ class TradingEngine:
                     'sol_value': self.sol_balance * current_price
                 })
         
+        # Final statistics
+        logger.info(f'Final signal distribution - BUY: {signal_counts["BUY"]}, SELL: {signal_counts["SELL"]}, HOLD: {signal_counts["HOLD"]}')
+        avg_confidence = confidence_sum / prediction_count if prediction_count > 0 else 0
+        logger.info(f'Average prediction confidence: {avg_confidence:.3f}, Threshold: {config.PREDICTION_THRESHOLD}')
+        
+        # Count signals above threshold
+        above_threshold = sum(1 for signal in ['BUY', 'SELL'] if signal_counts[signal] > 0)
+        logger.info(f'Predictions made: {prediction_count}, Trades attempted: {processed_trades}')
+        
         # Close final position if exists
         if self.position:
             final_price = backtest_data.iloc[-1]['close']
             self._execute_sell_sync(final_price, 1.0)
+            logger.info(f'Final position closed at ${final_price:.4f}')
         
         logger.info(f'Backtest completed - Processed {processed_trades} trading events')
         
@@ -526,6 +563,10 @@ class TradingEngine:
     
     def _execute_signal_sync(self, signal: str, confidence: float, current_price: float):
         """Synchronous signal execution for backtesting"""
+        # Debug logging for first few attempts
+        if self.backtest_index < config.LOOKBACK_PERIODS + 10:
+            logger.info(f'Signal attempt: {signal}, confidence: {confidence:.3f}, threshold: {config.PREDICTION_THRESHOLD}, has_position: {self.position is not None}')
+        
         if confidence < config.PREDICTION_THRESHOLD:
             return False
         
