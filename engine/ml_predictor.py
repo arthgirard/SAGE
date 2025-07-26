@@ -1,4 +1,4 @@
-# ml_predictor.py
+# engine/ml_predictor.py
 """Machine Learning predictor for SOL trading"""
 
 import numpy as np
@@ -10,9 +10,13 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix
 import pickle
 import os
+import sys
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
+
+# Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utilities.config import config
 from utilities.logger import logger, log_prediction
