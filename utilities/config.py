@@ -31,10 +31,10 @@ class Config:
     MAX_DAILY_LOSS = 0.05    # 5% max daily loss
     
     # ML parameters
-    LOOKBACK_PERIODS = 100
+    LOOKBACK_PERIODS = 50  # Reduced from 100 to ensure enough data
     FEATURES_COUNT = 20
     MODEL_RETRAIN_HOURS = 24
-    PREDICTION_THRESHOLD = 0.45  # Reduced from 0.6 to allow more trades
+    PREDICTION_THRESHOLD = 0.40  # Further reduced to allow more trades
     
     # Data settings
     TIMEFRAME = '1h'
