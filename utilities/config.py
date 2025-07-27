@@ -2,9 +2,12 @@
 """Configuration for SOL trading system"""
 
 import os
+import numpy as np
+import random
+from datetime import datetime
 
-# Suppress NumExpr threads warning
-os.environ['NUMEXPR_MAX_THREADS'] = '16'
+# Remove fixed random seeds to allow variation
+# os.environ['NUMEXPR_MAX_THREADS'] = '16'
 
 class Config:
     # Trading symbol
@@ -31,13 +34,25 @@ class Config:
     MAX_DAILY_LOSS = 0.05    # 5% max daily loss
     
     # ML parameters
-    LOOKBACK_PERIODS = 50  # Reduced from 100 to ensure enough data
+    LOOKBACK_PERIODS = 50
     FEATURES_COUNT = 20
     MODEL_RETRAIN_HOURS = 24
-    PREDICTION_THRESHOLD = 0.55  # Increased to make bot more selective and hold more
+    PREDICTION_THRESHOLD = 0.55
     
     # Data settings
     TIMEFRAME = '1h'
     DATA_LIMIT = 1000
+    
+    def __init__(self):
+        # Initialize with random seed based on current time to ensure variation
+        self.random_seed = int(datetime.now().timestamp() * 1000000) % 2**32
+        np.random.seed(self.random_seed)
+        random.seed(self.random_seed)
+    
+    def reset_randomness(self):
+        """Reset random seeds for new backtest run"""
+        self.random_seed = int(datetime.now().timestamp() * 1000000) % 2**32
+        np.random.seed(self.random_seed)
+        random.seed(self.random_seed)
 
 config = Config()
