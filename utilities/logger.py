@@ -3,18 +3,28 @@
 
 import logging
 import os
+import sys
 from datetime import datetime
 
 # Create logs directory
 os.makedirs('logs', exist_ok=True)
 
-# Setup logging
+# Fix Windows console encoding
+if sys.platform == "win32":
+    import codecs
+    sys.stdout = codecs.getwriter("utf-8")(sys.stdout.detach())
+    sys.stderr = codecs.getwriter("utf-8")(sys.stderr.detach())
+
+# Setup logging with UTF-8 encoding
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(f'logs/sol_trader_{datetime.now().strftime("%Y%m%d")}.log')
+        logging.FileHandler(
+            f'logs/sol_trader_{datetime.now().strftime("%Y%m%d")}.log',
+            encoding='utf-8'
+        )
     ]
 )
 
