@@ -183,4 +183,5 @@ cython_debug/
 # Custom
 /results
 /models
+/logs
 .csv
