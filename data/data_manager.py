@@ -66,23 +66,24 @@ class DataManager:
             return False
     
     def load_backtest_data(self, file_path='data/sol_data.csv'):
-        """Load data for backtesting with variation"""
+        """Load data for backtesting with minimal variation"""
         try:
             if os.path.exists(file_path):
-                # Load existing data but add some variation
+                # Load existing data with minimal variation for consistent model training
                 self.data = pd.read_csv(file_path, index_col=0, parse_dates=True)
                 
-                # Add small random variations to make each run different
-                price_variation = np.random.normal(0, 0.001, len(self.data))  # 0.1% random variation
-                volume_variation = np.random.normal(1, 0.05, len(self.data))   # 5% volume variation
+                # Add very small random variations to create slight differences between runs
+                # But keep them minimal so the model can learn consistent patterns
+                price_variation = np.random.normal(0, 0.0005, len(self.data))  # 0.05% variation
+                volume_variation = np.random.normal(1, 0.02, len(self.data))   # 2% volume variation
                 
                 self.data['close'] *= (1 + price_variation)
                 self.data['open'] *= (1 + price_variation * 0.8)
                 self.data['high'] *= (1 + np.maximum(price_variation, 0) * 1.2)
                 self.data['low'] *= (1 + np.minimum(price_variation, 0) * 1.2)
-                self.data['volume'] *= np.maximum(volume_variation, 0.1)  # Ensure positive volume
+                self.data['volume'] *= np.maximum(volume_variation, 0.1)
                 
-                logger.info(f'Loaded {len(self.data)} backtest data points with variations')
+                logger.info(f'Loaded {len(self.data)} backtest data points with minimal variations')
                 return True
             else:
                 # Generate new sample data
@@ -288,13 +289,11 @@ class DataManager:
         return np.array(features)
     
     def get_training_data(self, lookback=None):
-        """Get training data for ML model with randomization"""
+        """Get training data for ML model with consistent approach"""
         if self.features.empty:
             return None, None
         
-        # Add randomness to training data selection
-        start_offset = np.random.randint(0, min(20, len(self.features) // 10))
-        
+        # Use consistent training data selection for stable model learning
         feature_names = [
             'rsi', 'macd', 'macd_histogram', 'bb_position', 'volume_ratio',
             'price_change_1h', 'price_change_4h', 'price_change_24h',
@@ -304,8 +303,8 @@ class DataManager:
         X = []
         y = []
         
-        # Skip first 50 + offset rows to ensure all indicators are calculated
-        start_idx = 50 + start_offset
+        # Use consistent starting point for stable learning
+        start_idx = 50
         for i in range(start_idx, len(self.features) - 1):
             current_row = self.features.iloc[i]
             next_row = self.features.iloc[i + 1]
@@ -314,13 +313,13 @@ class DataManager:
             features = self._extract_simple_features(current_row)
             X.append(features)
             
-            # Target: price direction in next period with noise reduction
+            # Target: price direction in next period
             current_price = current_row['close']
             next_price = next_row['close']
             price_change = (next_price - current_price) / current_price
             
-            # Binary classification with random threshold variation
-            threshold = np.random.uniform(0.0005, 0.0015)  # 0.05% to 0.15% threshold
+            # Use consistent threshold for stable learning
+            threshold = 0.001  # 0.1% fixed threshold
             y.append(1 if price_change > threshold else 0)
         
         if len(X) == 0:
