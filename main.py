@@ -76,6 +76,10 @@ class SOLTrader:
         self.max_balance = config.INITIAL_BALANCE
         self.max_drawdown = 0.0
         
+        # Enhanced tracking
+        self.signal_history = []
+        self.trade_log_count = 0
+        
     async def start(self):
         """Start the SOL trading system"""
         try:
@@ -143,7 +147,7 @@ class SOLTrader:
                 logger.warning('Insufficient data for ML training')
     
     async def _run_backtest(self):
-        """Run backtesting mode"""
+        """Run backtesting mode with enhanced logging"""
         logger.info('Running complete backtest on SOL data')
         
         data = data_manager.features
@@ -164,8 +168,6 @@ class SOLTrader:
         holds_while_no_position = 0
         
         # Backtest loop
-        hold_log_count = 0
-        
         for i in range(start_idx, len(data)):
             
             # Extract features
@@ -192,28 +194,31 @@ class SOLTrader:
                     hold_signals += 1
                     if self.position is not None:
                         holds_while_in_position += 1
-                        # Log some HOLD actions while in position
-                        if hold_log_count < 10:
-                            logger.info(f'HOLD: ${current_price:.4f} | In Position | Confidence: {confidence:.3f}')
-                            hold_log_count += 1
                     else:
                         holds_while_no_position += 1
-                        # Log some HOLD actions while waiting
-                        if hold_log_count < 15:
-                            logger.info(f'HOLD: ${current_price:.4f} | Waiting | Confidence: {confidence:.3f}')
-                            hold_log_count += 1
                 
-                # Execute trading logic
-                await self._process_signal(signal, confidence, current_price, data.index[i])
+                # Store signal for analysis
+                self.signal_history.append({
+                    'index': i,
+                    'signal': signal,
+                    'confidence': confidence,
+                    'price': current_price,
+                    'has_position': self.position is not None
+                })
+                
+                # Execute trading logic with enhanced logging
+                executed = await self._process_signal_with_logging(signal, confidence, current_price, data.index[i], i)
                 
             except Exception as e:
                 logger.error(f'Error at index {i}: {e}')
             
-            # Progress logging
+            # Progress logging with signal stats
             if i % 1000 == 0:
                 progress = (i - start_idx) / (len(data) - start_idx) * 100
                 portfolio_value = self.balance + (self.sol_balance * current_price)
-                logger.info(f'Progress: {progress:.1f}% | Portfolio: ${portfolio_value:.2f} | Trades: {len(self.trades)} | Holds: {hold_signals}')
+                logger.info(f'Progress: {progress:.1f}% | Portfolio: ${portfolio_value:.2f} | Trades: {len(self.trades)}')
+                logger.info(f'Signals - BUY:{buy_signals} SELL:{sell_signals} HOLD:{hold_signals}')
+                logger.info(f'Actions - Buy attempts:{buy_attempts} Sell attempts:{sell_attempts}')
         
         # Close final position
         if self.position:
@@ -226,26 +231,53 @@ class SOLTrader:
             buy_attempts, sell_attempts, holds_while_in_position, holds_while_no_position
         )
     
-    async def _process_signal(self, signal, confidence, current_price, timestamp):
-        """Process trading signal with HOLD logic and position management"""
+    async def _process_signal_with_logging(self, signal, confidence, current_price, timestamp, index):
+        """Process signal with detailed logging"""
         
-        # HOLD signal - maintain current position
+        # Log every 100th signal to track activity
+        if index % 100 == 0 or len(self.trades) < 50:
+            logger.info(f'Index {index}: {signal} conf:{confidence:.3f} price:${current_price:.4f} pos:{self.position is not None}')
+        
+        # HOLD signal logic with improved thresholds
         if signal == 'HOLD':
-            return  # Do nothing, keep current state
+            return False
+        
+        # Enhanced confidence thresholds for more selective trading
+        min_confidence = config.PREDICTION_THRESHOLD
         
         # BUY signal - only if no position and confidence is high enough
-        if signal == 'BUY' and confidence > config.PREDICTION_THRESHOLD:
-            if self.position is None:
-                await self._execute_buy(current_price, confidence, timestamp)
-            # If already have position, HOLD (don't buy more)
-            return
+        if signal == 'BUY':
+            if self.position is not None:
+                # Already have position - log hold decision
+                if index % 500 == 0:  # Log occasionally
+                    logger.info(f'BUY signal ignored - already in position at ${current_price:.4f}')
+                return False
+            
+            if confidence <= min_confidence:
+                # Confidence too low - log hold decision
+                if index % 500 == 0:  # Log occasionally
+                    logger.info(f'BUY signal ignored - low confidence {confidence:.3f} < {min_confidence}')
+                return False
+            
+            # Execute buy
+            return await self._execute_buy(current_price, confidence, timestamp)
         
         # SELL signal - only if we have a position and confidence is high enough  
-        if signal == 'SELL' and confidence > config.PREDICTION_THRESHOLD:
-            if self.position is not None:
-                await self._execute_sell(current_price, confidence, timestamp, "SELL_SIGNAL")
-            # If no position, HOLD (don't short sell)
-            return
+        if signal == 'SELL':
+            if self.position is None:
+                # No position to sell - log hold decision
+                if index % 500 == 0:  # Log occasionally
+                    logger.info(f'SELL signal ignored - no position at ${current_price:.4f}')
+                return False
+            
+            if confidence <= min_confidence:
+                # Confidence too low - log hold decision
+                if index % 500 == 0:  # Log occasionally
+                    logger.info(f'SELL signal ignored - low confidence {confidence:.3f} < {min_confidence}')
+                return False
+            
+            # Execute sell
+            return await self._execute_sell(current_price, confidence, timestamp, "SELL_SIGNAL")
         
         # Check stop loss/take profit regardless of signal
         if self.position is not None:
@@ -261,10 +293,50 @@ class SOLTrader:
                 sell_reason = "TAKE_PROFIT"
             
             if should_sell:
-                await self._execute_sell(current_price, confidence, timestamp, sell_reason)
+                logger.info(f'{sell_reason} triggered at ${current_price:.4f}')
+                return await self._execute_sell(current_price, confidence, timestamp, sell_reason)
+        
+        return False
+    
+    async def _process_signal(self, signal, confidence, current_price, timestamp):
+        """Original process signal method for live trading"""
+        
+        # HOLD signal - maintain current position
+        if signal == 'HOLD':
+            return False
+        
+        # BUY signal - only if no position and confidence is high enough
+        if signal == 'BUY' and confidence > config.PREDICTION_THRESHOLD:
+            if self.position is None:
+                return await self._execute_buy(current_price, confidence, timestamp)
+            return False
+        
+        # SELL signal - only if we have a position and confidence is high enough  
+        if signal == 'SELL' and confidence > config.PREDICTION_THRESHOLD:
+            if self.position is not None:
+                return await self._execute_sell(current_price, confidence, timestamp, "SELL_SIGNAL")
+            return False
+        
+        # Check stop loss/take profit regardless of signal
+        if self.position is not None:
+            should_sell = False
+            sell_reason = ""
+            
+            # Check stop loss/take profit
+            if current_price <= self.position['stop_loss']:
+                should_sell = True
+                sell_reason = "STOP_LOSS"
+            elif current_price >= self.position['take_profit']:
+                should_sell = True
+                sell_reason = "TAKE_PROFIT"
+            
+            if should_sell:
+                return await self._execute_sell(current_price, confidence, timestamp, sell_reason)
+        
+        return False
     
     async def _execute_buy(self, price, confidence, timestamp):
-        """Execute buy order"""
+        """Execute buy order with continuous logging"""
         try:
             # Calculate position size
             risk_amount = self.balance * config.MAX_POSITION_SIZE * confidence
@@ -296,8 +368,10 @@ class SOLTrader:
                     'confidence': confidence
                 })
                 
-                if len(self.trades) <= 20:  # Log first 20 trades
-                    logger.info(f'BUY: ${price:.4f} | Amount: {amount:.4f} SOL | Confidence: {confidence:.3f}')
+                self.trade_log_count += 1
+                
+                # Log every trade (not just first 20)
+                logger.info(f'BUY #{self.trade_log_count}: ${price:.4f} | Amount: {amount:.4f} SOL | Confidence: {confidence:.3f} | Balance: ${self.balance:.2f}')
                 
                 return True
         
@@ -307,7 +381,7 @@ class SOLTrader:
         return False
     
     async def _execute_sell(self, price, confidence, timestamp, reason="SELL_SIGNAL"):
-        """Execute sell order"""
+        """Execute sell order with continuous logging"""
         try:
             if not self.position:
                 return False
@@ -340,8 +414,10 @@ class SOLTrader:
                 'reason': reason
             })
             
-            if len(self.trades) <= 40:  # Log first 40 trades
-                logger.info(f'SELL: ${price:.4f} | PnL: ${pnl:.2f} | Reason: {reason}')
+            self.trade_log_count += 1
+            
+            # Log every trade (not just first 40)
+            logger.info(f'SELL #{self.trade_log_count}: ${price:.4f} | PnL: ${pnl:.2f} | Reason: {reason} | Balance: ${self.balance:.2f}')
             
             self.position = None
             return True
@@ -395,6 +471,14 @@ class SOLTrader:
         else:
             sharpe_ratio = 0
         
+        # Analyze signal effectiveness
+        high_conf_buy = sum(1 for s in self.signal_history if s['signal'] == 'BUY' and s['confidence'] > config.PREDICTION_THRESHOLD)
+        high_conf_sell = sum(1 for s in self.signal_history if s['signal'] == 'SELL' and s['confidence'] > config.PREDICTION_THRESHOLD)
+        high_conf_hold = sum(1 for s in self.signal_history if s['signal'] == 'HOLD' and s['confidence'] > config.PREDICTION_THRESHOLD)
+        
+        start_date = data_manager.features.index[0].strftime('%Y-%m-%d')
+        end_date = data_manager.features.index[-1].strftime('%Y-%m-%d')
+        
         print("\n" + "="*70)
         print("SOL TRADING SYSTEM - COMPREHENSIVE BACKTEST RESULTS")
         print("="*70)
@@ -411,6 +495,9 @@ class SOLTrader:
         print(f"BUY Signals: {buy_signals:,} ({buy_signals/total_predictions:.1%})")
         print(f"SELL Signals: {sell_signals:,} ({sell_signals/total_predictions:.1%})")
         print(f"HOLD Signals: {hold_signals:,} ({hold_signals/total_predictions:.1%})")
+        print(f"High Confidence BUY: {high_conf_buy:,}")
+        print(f"High Confidence SELL: {high_conf_sell:,}")
+        print(f"High Confidence HOLD: {high_conf_hold:,}")
         print("-" * 70)
         print("TRADING BEHAVIOR:")
         print(f"Buy Attempts: {buy_attempts}")
@@ -418,7 +505,7 @@ class SOLTrader:
         print(f"Holds while in position: {holds_while_in_position}")
         print(f"Holds while no position: {holds_while_no_position}")
         print(f"Actual Trades Executed: {len(self.trades)}")
-        print(f"Buy-to-Sell Efficiency: {sell_attempts/buy_attempts:.1%}" if buy_attempts > 0 else "Buy-to-Sell Efficiency: N/A")
+        print(f"Trade Execution Rate: {len(self.trades)/(buy_attempts+sell_attempts):.1%}" if (buy_attempts+sell_attempts) > 0 else "Trade Execution Rate: N/A")
         print("-" * 70)
         print("PERFORMANCE METRICS:")
         print(f"Profitable Trades: {profitable_trades}")
@@ -450,7 +537,10 @@ class SOLTrader:
                 'buy_attempts': buy_attempts,
                 'sell_attempts': sell_attempts,
                 'holds_while_in_position': holds_while_in_position,
-                'holds_while_no_position': holds_while_no_position
+                'holds_while_no_position': holds_while_no_position,
+                'high_conf_buy': high_conf_buy,
+                'high_conf_sell': high_conf_sell,
+                'high_conf_hold': high_conf_hold
             },
             'avg_holding_time_hours': avg_holding_time
         })
@@ -562,7 +652,8 @@ class SOLTrader:
                     'prediction_threshold': config.PREDICTION_THRESHOLD
                 },
                 'results': results,
-                'trades': trades_data
+                'trades': trades_data,
+                'signal_history': self.signal_history[-1000:]  # Save last 1000 signals for analysis
             }
             
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -625,14 +716,14 @@ async def main():
     config.SYMBOL = args.symbol
     config.INITIAL_BALANCE = args.balance
     
-    print("🟢 SOL Trading System")
+    print("SOL Trading System")
     print(f"Mode: {config.MODE.upper()}")
     print(f"Symbol: {config.SYMBOL}")
     print(f"Initial Balance: ${config.INITIAL_BALANCE:.2f}")
     print("-" * 40)
     
     if config.MODE in ['paper', 'live'] and not config.BINANCE_API_KEY:
-        print("⚠️  Please set BINANCE_API_KEY and BINANCE_API_SECRET environment variables")
+        print("Please set BINANCE_API_KEY and BINANCE_API_SECRET environment variables")
         print("For testnet keys, visit: https://testnet.binance.vision/")
         return
     
