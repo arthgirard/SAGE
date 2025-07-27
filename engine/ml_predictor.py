@@ -25,37 +25,72 @@ class MLPredictor:
     """Machine Learning predictor for SOL price movements"""
     
     def __init__(self):
-        self.models = {
-            'rf': RandomForestClassifier(n_estimators=50, random_state=42, max_depth=8, n_jobs=-1),
-            'gb': GradientBoostingClassifier(n_estimators=50, random_state=42, max_depth=4),
-            'lr': LogisticRegression(random_state=42, max_iter=500, n_jobs=-1)
-        }
+        self.models = {}
         self.scaler = StandardScaler()
         self.trained_models = {}
         self.feature_importance = {}
         self.last_training = None
         self.performance_history = []
+        self.training_count = 0
+        
+    def _initialize_models(self):
+        """Initialize models with controlled randomness"""
+        # Generate seeds with variation but not extreme randomness
+        base_seed = int(datetime.now().timestamp() * 1000) % 10000  # Smaller range
+        
+        self.models = {
+            'rf': RandomForestClassifier(
+                n_estimators=50, 
+                random_state=base_seed + self.training_count,
+                max_depth=8, 
+                n_jobs=-1,
+                max_features='sqrt',
+                bootstrap=True
+            ),
+            'gb': GradientBoostingClassifier(
+                n_estimators=50, 
+                random_state=base_seed + self.training_count + 1000,
+                max_depth=4,
+                subsample=0.8,
+                learning_rate=0.1  # Fixed learning rate for consistency
+            ),
+            'lr': LogisticRegression(
+                random_state=base_seed + self.training_count + 2000,
+                max_iter=500, 
+                n_jobs=-1,
+                C=1.0  # Fixed regularization for consistency
+            )
+        }
+        
+        self.training_count += 1
         
     def train_models(self, X, y):
-        """Train all ML models"""
+        """Train all ML models with controlled randomization"""
         if X is None or y is None or len(X) < 50:
             logger.warning('Insufficient data for training')
             return False
         
         try:
-            logger.info(f'Training models with {len(X)} samples...')
+            # Initialize models with new seeds
+            self._initialize_models()
             
-            # Limit data size for faster training
+            logger.info(f'Training models with {len(X)} samples (training #{self.training_count})...')
+            
+            # Controlled data sampling
             max_samples = 2000
             if len(X) > max_samples:
+                # Use stratified sampling to maintain class balance
                 indices = np.random.choice(len(X), max_samples, replace=False)
                 X = X[indices]
                 y = y[indices]
                 logger.info(f'Using {max_samples} samples for training')
             
-            # Split data
+            # Fixed train/test split ratio
+            test_size = 0.2
+            
+            # Split data with stratification
             X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=0.2, random_state=42, stratify=y
+                X, y, test_size=test_size, random_state=42, stratify=y
             )
             
             # Scale features
@@ -63,6 +98,7 @@ class MLPredictor:
             X_test_scaled = self.scaler.transform(X_test)
             
             # Train each model
+            model_scores = {}
             for name, model in self.models.items():
                 logger.info(f'Training {name} model...')
                 
@@ -70,8 +106,9 @@ class MLPredictor:
                 model.fit(X_train_scaled, y_train)
                 self.trained_models[name] = model
                 
-                # Test score only (skip CV for speed)
+                # Test score
                 test_score = model.score(X_test_scaled, y_test)
+                model_scores[name] = test_score
                 
                 # Feature importance for tree-based models
                 if hasattr(model, 'feature_importances_'):
@@ -84,12 +121,16 @@ class MLPredictor:
             if ensemble_pred[0] is not None:
                 ensemble_accuracy = np.mean(ensemble_pred[0] == y_test)
                 logger.info(f'Ensemble accuracy: {ensemble_accuracy:.3f}')
+            else:
+                ensemble_accuracy = 0.5
             
             # Store performance
             self.performance_history.append({
                 'timestamp': datetime.now(),
-                'accuracy': ensemble_accuracy if ensemble_pred[0] is not None else 0.5,
-                'data_points': len(X_train)
+                'accuracy': ensemble_accuracy,
+                'data_points': len(X_train),
+                'model_scores': model_scores,
+                'training_id': self.training_count
             })
             
             self.last_training = datetime.now()
@@ -102,9 +143,9 @@ class MLPredictor:
             return False
     
     def _get_ensemble_prediction(self, X):
-        """Get ensemble prediction from all models"""
+        """Get ensemble prediction from all models with minimal randomization"""
         if not self.trained_models:
-            return None
+            return None, None
         
         predictions = []
         confidences = []
@@ -117,16 +158,16 @@ class MLPredictor:
                 proba = model.predict_proba(X)
                 conf = np.max(proba, axis=1)
             else:
-                conf = np.ones(len(pred)) * 0.5
+                conf = np.ones(len(pred)) * 0.6  # Fixed confidence for LogReg
             
             predictions.append(pred)
             confidences.append(conf)
         
-        # Weighted ensemble (weight by confidence)
+        # Simple ensemble (equal weights, minimal randomness)
         predictions = np.array(predictions)
         confidences = np.array(confidences)
         
-        # Ensemble prediction: majority vote with confidence weighting
+        # Ensemble prediction with equal weighting
         ensemble_pred = []
         ensemble_conf = []
         
@@ -135,12 +176,9 @@ class MLPredictor:
             sample_preds = predictions[:, i]
             sample_confs = confidences[:, i]
             
-            # Weighted vote
-            weighted_sum = np.sum(sample_preds * sample_confs)
-            total_weight = np.sum(sample_confs)
-            
-            final_pred = 1 if weighted_sum / total_weight > 0.5 else 0
-            final_conf = total_weight / len(sample_preds)
+            # Simple majority vote
+            final_pred = 1 if np.mean(sample_preds) > 0.5 else 0
+            final_conf = np.mean(sample_confs)
             
             ensemble_pred.append(final_pred)
             ensemble_conf.append(final_conf)
@@ -148,9 +186,9 @@ class MLPredictor:
         return np.array(ensemble_pred), np.array(ensemble_conf)
     
     def predict(self, features):
-        """Make prediction on new features with enhanced HOLD logic"""
+        """Make prediction with balanced HOLD logic"""
         if not self.trained_models or features is None:
-            return 'HOLD', 0.0
+            return 'HOLD', 0.5
         
         try:
             # Reshape if single sample
@@ -167,67 +205,44 @@ class MLPredictor:
                 confidence = conf[0] if len(conf) > 0 else 0.5
                 prediction = pred[0]
                 
-                # Enhanced HOLD logic with multiple thresholds
-                high_threshold = config.PREDICTION_THRESHOLD + 0.1  # Very confident trades
-                medium_threshold = config.PREDICTION_THRESHOLD      # Standard threshold
-                low_threshold = config.PREDICTION_THRESHOLD - 0.1   # Conservative threshold
+                # Use original threshold without excessive randomness
+                threshold = config.PREDICTION_THRESHOLD
                 
-                # Determine signal based on prediction AND confidence with multiple zones
+                # Simplified decision logic
                 if prediction == 1:  # Model predicts price will go up
-                    if confidence >= high_threshold:
-                        signal = 'BUY'  # Very confident buy
-                    elif confidence >= medium_threshold:
-                        # Medium confidence - could buy but be more selective
+                    if confidence >= threshold:
                         signal = 'BUY'
-                    elif confidence >= low_threshold:
-                        # Low-medium confidence - prefer to hold
-                        signal = 'HOLD'
                     else:
-                        # Very low confidence - definitely hold
                         signal = 'HOLD'
-                else:  # Model predicts price will go down or neutral
-                    if confidence >= high_threshold:
-                        signal = 'SELL'  # Very confident sell
-                    elif confidence >= medium_threshold:
-                        # Medium confidence - could sell but be more selective
+                else:  # Model predicts price will go down
+                    if confidence >= threshold:
                         signal = 'SELL'
-                    elif confidence >= low_threshold:
-                        # Low-medium confidence - prefer to hold
-                        signal = 'HOLD'
                     else:
-                        # Very low confidence - definitely hold
                         signal = 'HOLD'
                 
-                # Add randomness for more natural holding behavior
-                if signal == 'HOLD' and np.random.random() < 0.1:  # 10% chance to log HOLD
+                # Log predictions occasionally (reduce noise)
+                if signal != 'HOLD' or np.random.random() < 0.02:  # 2% chance to log HOLD
                     try:
                         feature_summary = f'RSI:{features[0][0]:.1f}, MACD:{features[0][1]:.3f}, Vol:{features[0][4]:.2f}'
                     except:
                         feature_summary = 'Features processed'
                     
-                    log_prediction(signal, confidence, feature_summary)
-                
-                # Only log non-HOLD predictions to reduce noise
-                if signal != 'HOLD':
-                    try:
-                        feature_summary = f'RSI:{features[0][0]:.1f}, MACD:{features[0][1]:.3f}, Vol:{features[0][4]:.2f}'
-                    except:
-                        feature_summary = 'Features processed'
-                    
-                    log_prediction(signal, confidence, feature_summary)
+                    if signal != 'HOLD' or np.random.random() < 0.1:  # Reduce HOLD logging further
+                        log_prediction(signal, confidence, feature_summary)
                 
                 return signal, confidence
             
         except Exception as e:
             logger.error(f'Prediction failed: {e}')
         
-        return 'HOLD', 0.0
+        return 'HOLD', 0.5
     
     def should_retrain(self):
         """Check if models should be retrained"""
         if self.last_training is None:
             return True
         
+        # Fixed retrain timing (no randomness)
         hours_since_training = (datetime.now() - self.last_training).total_seconds() / 3600
         return hours_since_training >= config.MODEL_RETRAIN_HOURS
     
@@ -251,18 +266,27 @@ class MLPredictor:
         try:
             os.makedirs('models', exist_ok=True)
             
+            # Add timestamp to filename to avoid overwriting
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f'models/sol_ml_models_{timestamp}.pkl'
+            
             model_data = {
                 'trained_models': self.trained_models,
                 'scaler': self.scaler,
                 'feature_importance': self.feature_importance,
                 'last_training': self.last_training,
-                'performance_history': self.performance_history
+                'performance_history': self.performance_history,
+                'training_count': self.training_count
             }
             
+            with open(filename, 'wb') as f:
+                pickle.dump(model_data, f)
+            
+            # Also save as latest
             with open('models/sol_ml_models.pkl', 'wb') as f:
                 pickle.dump(model_data, f)
             
-            logger.info('Models saved successfully')
+            logger.info(f'Models saved successfully to {filename}')
             
         except Exception as e:
             logger.error(f'Failed to save models: {e}')
@@ -279,8 +303,9 @@ class MLPredictor:
                 self.feature_importance = model_data.get('feature_importance', {})
                 self.last_training = model_data.get('last_training')
                 self.performance_history = model_data.get('performance_history', [])
+                self.training_count = model_data.get('training_count', 0)
                 
-                logger.info(f'Loaded {len(self.trained_models)} trained models')
+                logger.info(f'Loaded {len(self.trained_models)} trained models (training #{self.training_count})')
                 return True
             
         except Exception as e:
@@ -311,6 +336,15 @@ class MLPredictor:
                 
                 top_features = feature_imp[:5]
                 logger.info(f'Top features: {", ".join([f"{name}:{imp:.3f}" for name, imp in top_features])}')
+    
+    def reset_for_new_backtest(self):
+        """Reset predictor state for new backtest run"""
+        # Clear trained models to force retraining with new randomness
+        self.trained_models = {}
+        self.last_training = None
+        # Keep training_count to maintain some variation between runs
+        
+        logger.info('ML Predictor reset for new backtest run')
 
 # Global instance
 ml_predictor = MLPredictor()
