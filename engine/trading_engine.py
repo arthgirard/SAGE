@@ -16,7 +16,6 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utilities.config import config
 from utilities.logger import logger, log_trade, log_performance, log_backtest_result
-# Import ml_predictor only when needed to avoid circular imports
 
 @dataclass
 class Trade:
@@ -101,6 +100,8 @@ class TradingEngine:
     
     def _initialize_backtest(self):
         """Initialize for backtesting"""
+        # Import here to avoid circular imports
+        from data.data_manager import data_manager
         self.backtest_data = data_manager.features.copy()
         self.backtest_index = config.LOOKBACK_PERIODS
         logger.info(f'Backtest initialized - {len(self.backtest_data)} data points')
@@ -380,6 +381,10 @@ class TradingEngine:
         
         logger.info('Starting backtest...')
         
+        # Import here to avoid circular imports
+        from data.data_manager import data_manager
+        from engine.ml_predictor import ml_predictor
+        
         # Filter data by date range if provided
         backtest_data = self.backtest_data.copy()
         if start_date:
@@ -518,32 +523,29 @@ class TradingEngine:
         if index < config.LOOKBACK_PERIODS:
             return None
         
-        # Get historical data for features
-        historical_data = data.iloc[index - config.LOOKBACK_PERIODS:index + 1]
+        if index >= len(data):
+            return None
         
-        # Calculate features similar to data_manager
-        latest = historical_data.iloc[-1]
-        
-        feature_names = [
-            'rsi', 'macd', 'macd_histogram', 'bb_position', 'volume_ratio',
-            'price_change_1h', 'price_change_4h', 'price_change_24h',
-            'volatility', 'price_position'
-        ]
-        
-        features = []
-        for name in feature_names:
-            if name in latest:
-                features.append(latest[name])
-            else:
-                features.append(0.0)
-        
-        # Add price ratios
-        features.extend([
-            latest['close'] / latest['sma_20'] if latest['sma_20'] > 0 else 1.0,
-            latest['close'] / latest['sma_50'] if latest['sma_50'] > 0 else 1.0,
-            latest['sma_20'] / latest['sma_50'] if latest['sma_50'] > 0 else 1.0,
-        ])
-        
+        try:
+            # Import here to avoid circular imports
+            from data.data_manager import data_manager
+            
+            # Get current data point
+            current_row = data.iloc[index]
+            
+            # Use data_manager's feature extraction method
+            features = data_manager._extract_simple_features(current_row)
+            
+            # Ensure proper shape for model input
+            if features is not None and len(features) > 0:
+                return features.reshape(1, -1)
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f'Error extracting features at index {index}: {e}')
+            return None
+    
     def _check_stop_loss_take_profit_sync(self, current_price: float):
         """Synchronous version for backtesting"""
         if not self.position:
