@@ -34,7 +34,7 @@ class Config:
     LOOKBACK_PERIODS = 50  # Reduced from 100 to ensure enough data
     FEATURES_COUNT = 20
     MODEL_RETRAIN_HOURS = 24
-    PREDICTION_THRESHOLD = 0.40  # Further reduced to allow more trades
+    PREDICTION_THRESHOLD = 0.55  # Increased to make bot more selective and hold more
     
     # Data settings
     TIMEFRAME = '1h'

@@ -157,7 +157,15 @@ class SOLTrader:
         sell_signals = 0
         hold_signals = 0
         
+        # Trading stats
+        buy_attempts = 0
+        sell_attempts = 0
+        holds_while_in_position = 0
+        holds_while_no_position = 0
+        
         # Backtest loop
+        hold_log_count = 0
+        
         for i in range(start_idx, len(data)):
             
             # Extract features
@@ -169,16 +177,33 @@ class SOLTrader:
             try:
                 signal, confidence = ml_predictor.predict(features)
                 total_predictions += 1
+                current_price = data.iloc[i]['close']
                 
+                # Track signal distribution
                 if signal == 'BUY':
                     buy_signals += 1
+                    if self.position is None and confidence > config.PREDICTION_THRESHOLD:
+                        buy_attempts += 1
                 elif signal == 'SELL':
                     sell_signals += 1
-                else:
+                    if self.position is not None and confidence > config.PREDICTION_THRESHOLD:
+                        sell_attempts += 1
+                else:  # HOLD
                     hold_signals += 1
+                    if self.position is not None:
+                        holds_while_in_position += 1
+                        # Log some HOLD actions while in position
+                        if hold_log_count < 10:
+                            logger.info(f'HOLD: ${current_price:.4f} | In Position | Confidence: {confidence:.3f}')
+                            hold_log_count += 1
+                    else:
+                        holds_while_no_position += 1
+                        # Log some HOLD actions while waiting
+                        if hold_log_count < 15:
+                            logger.info(f'HOLD: ${current_price:.4f} | Waiting | Confidence: {confidence:.3f}')
+                            hold_log_count += 1
                 
                 # Execute trading logic
-                current_price = data.iloc[i]['close']
                 await self._process_signal(signal, confidence, current_price, data.index[i])
                 
             except Exception as e:
@@ -188,7 +213,7 @@ class SOLTrader:
             if i % 1000 == 0:
                 progress = (i - start_idx) / (len(data) - start_idx) * 100
                 portfolio_value = self.balance + (self.sol_balance * current_price)
-                logger.info(f'Progress: {progress:.1f}% | Portfolio: ${portfolio_value:.2f} | Trades: {len(self.trades)}')
+                logger.info(f'Progress: {progress:.1f}% | Portfolio: ${portfolio_value:.2f} | Trades: {len(self.trades)} | Holds: {hold_signals}')
         
         # Close final position
         if self.position:
@@ -196,17 +221,34 @@ class SOLTrader:
             await self._execute_sell(final_price, 1.0, data.index[-1], "FINAL_CLOSE")
         
         # Calculate and display results
-        await self._display_backtest_results(total_predictions, buy_signals, sell_signals, hold_signals)
+        await self._display_backtest_results(
+            total_predictions, buy_signals, sell_signals, hold_signals,
+            buy_attempts, sell_attempts, holds_while_in_position, holds_while_no_position
+        )
     
     async def _process_signal(self, signal, confidence, current_price, timestamp):
-        """Process trading signal"""
+        """Process trading signal with HOLD logic and position management"""
         
-        # Buy signal
-        if signal == 'BUY' and confidence > config.PREDICTION_THRESHOLD and self.position is None:
-            await self._execute_buy(current_price, confidence, timestamp)
+        # HOLD signal - maintain current position
+        if signal == 'HOLD':
+            return  # Do nothing, keep current state
         
-        # Check stop loss/take profit or sell signal
-        elif self.position is not None:
+        # BUY signal - only if no position and confidence is high enough
+        if signal == 'BUY' and confidence > config.PREDICTION_THRESHOLD:
+            if self.position is None:
+                await self._execute_buy(current_price, confidence, timestamp)
+            # If already have position, HOLD (don't buy more)
+            return
+        
+        # SELL signal - only if we have a position and confidence is high enough  
+        if signal == 'SELL' and confidence > config.PREDICTION_THRESHOLD:
+            if self.position is not None:
+                await self._execute_sell(current_price, confidence, timestamp, "SELL_SIGNAL")
+            # If no position, HOLD (don't short sell)
+            return
+        
+        # Check stop loss/take profit regardless of signal
+        if self.position is not None:
             should_sell = False
             sell_reason = ""
             
@@ -217,9 +259,6 @@ class SOLTrader:
             elif current_price >= self.position['take_profit']:
                 should_sell = True
                 sell_reason = "TAKE_PROFIT"
-            elif signal == 'SELL' and confidence > config.PREDICTION_THRESHOLD:
-                should_sell = True
-                sell_reason = "SELL_SIGNAL"
             
             if should_sell:
                 await self._execute_sell(current_price, confidence, timestamp, sell_reason)
@@ -312,7 +351,8 @@ class SOLTrader:
         
         return False
     
-    async def _display_backtest_results(self, total_predictions, buy_signals, sell_signals, hold_signals):
+    async def _display_backtest_results(self, total_predictions, buy_signals, sell_signals, hold_signals,
+                                       buy_attempts, sell_attempts, holds_while_in_position, holds_while_no_position):
         """Display comprehensive backtest results"""
         
         # Calculate metrics
@@ -328,6 +368,21 @@ class SOLTrader:
         # Calculate total PnL
         total_pnl = sum(t.get('pnl', 0) for t in self.trades)
         
+        # Calculate average holding time
+        holding_times = []
+        for i in range(0, len(self.trades), 2):  # Buy/Sell pairs
+            if i + 1 < len(self.trades):
+                buy_time = self.trades[i]['timestamp']
+                sell_time = self.trades[i + 1]['timestamp']
+                if isinstance(buy_time, str):
+                    buy_time = datetime.fromisoformat(buy_time)
+                if isinstance(sell_time, str):
+                    sell_time = datetime.fromisoformat(sell_time)
+                holding_time = (sell_time - buy_time).total_seconds() / 3600  # hours
+                holding_times.append(holding_time)
+        
+        avg_holding_time = np.mean(holding_times) if holding_times else 0
+        
         # Calculate Sharpe ratio (simplified)
         if len(self.trades) > 1:
             returns = [t.get('pnl', 0) / initial_balance for t in self.trades if 'pnl' in t]
@@ -340,13 +395,9 @@ class SOLTrader:
         else:
             sharpe_ratio = 0
         
-        # Display results
-        start_date = data_manager.features.index[0].strftime('%Y-%m-%d')
-        end_date = data_manager.features.index[-1].strftime('%Y-%m-%d')
-        
-        print("\n" + "="*60)
-        print("SAGE - BACKTEST RESULTS")
-        print("="*60)
+        print("\n" + "="*70)
+        print("SOL TRADING SYSTEM - COMPREHENSIVE BACKTEST RESULTS")
+        print("="*70)
         print(f"Period: {start_date} to {end_date}")
         print(f"Initial Balance: ${initial_balance:,.2f}")
         print(f"Final Balance: ${self.balance:,.2f}")
@@ -354,17 +405,29 @@ class SOLTrader:
         print(f"Final Portfolio Value: ${final_portfolio_value:,.2f}")
         print(f"Total Return: {total_return:.1%}")
         print(f"Total PnL: ${total_pnl:,.2f}")
-        print("-" * 60)
+        print("-" * 70)
+        print("SIGNAL ANALYSIS:")
         print(f"Total Predictions: {total_predictions:,}")
-        print(f"BUY Signals: {buy_signals:,}")
-        print(f"SELL Signals: {sell_signals:,}")
-        print(f"HOLD Signals: {hold_signals:,}")
-        print(f"Trades Executed: {len(self.trades)}")
+        print(f"BUY Signals: {buy_signals:,} ({buy_signals/total_predictions:.1%})")
+        print(f"SELL Signals: {sell_signals:,} ({sell_signals/total_predictions:.1%})")
+        print(f"HOLD Signals: {hold_signals:,} ({hold_signals/total_predictions:.1%})")
+        print("-" * 70)
+        print("TRADING BEHAVIOR:")
+        print(f"Buy Attempts: {buy_attempts}")
+        print(f"Sell Attempts: {sell_attempts}")
+        print(f"Holds while in position: {holds_while_in_position}")
+        print(f"Holds while no position: {holds_while_no_position}")
+        print(f"Actual Trades Executed: {len(self.trades)}")
+        print(f"Buy-to-Sell Efficiency: {sell_attempts/buy_attempts:.1%}" if buy_attempts > 0 else "Buy-to-Sell Efficiency: N/A")
+        print("-" * 70)
+        print("PERFORMANCE METRICS:")
         print(f"Profitable Trades: {profitable_trades}")
         print(f"Win Rate: {win_rate:.1%}")
+        print(f"Average Holding Time: {avg_holding_time:.1f} hours")
         print(f"Max Drawdown: {self.max_drawdown:.1%}")
         print(f"Sharpe Ratio: {sharpe_ratio:.2f}")
-        print("="*60)
+        print(f"Prediction Threshold Used: {config.PREDICTION_THRESHOLD}")
+        print("="*70)
         
         # Log final performance
         log_performance(len(self.trades), win_rate, total_pnl, self.max_drawdown)
@@ -378,7 +441,18 @@ class SOLTrader:
             'max_drawdown': self.max_drawdown,
             'sharpe_ratio': sharpe_ratio,
             'current_balance': self.balance,
-            'sol_balance': self.sol_balance
+            'sol_balance': self.sol_balance,
+            'signal_analysis': {
+                'total_predictions': total_predictions,
+                'buy_signals': buy_signals,
+                'sell_signals': sell_signals,
+                'hold_signals': hold_signals,
+                'buy_attempts': buy_attempts,
+                'sell_attempts': sell_attempts,
+                'holds_while_in_position': holds_while_in_position,
+                'holds_while_no_position': holds_while_no_position
+            },
+            'avg_holding_time_hours': avg_holding_time
         })
     
     async def _run_live_trading(self):
@@ -534,7 +608,7 @@ class SOLTrader:
 
 def parse_arguments():
     """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='Solana Analysis and Guidance Engine')
+    parser = argparse.ArgumentParser(description='SOL Trading System')
     parser.add_argument('--mode', choices=['backtest', 'paper', 'live'], 
                        default='paper', help='Trading mode')
     parser.add_argument('--symbol', default='SOL/USDT', help='Trading symbol')
@@ -551,7 +625,7 @@ async def main():
     config.SYMBOL = args.symbol
     config.INITIAL_BALANCE = args.balance
     
-    print("🟢 SAGE online")
+    print("🟢 SOL Trading System")
     print(f"Mode: {config.MODE.upper()}")
     print(f"Symbol: {config.SYMBOL}")
     print(f"Initial Balance: ${config.INITIAL_BALANCE:.2f}")

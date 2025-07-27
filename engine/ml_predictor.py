@@ -148,7 +148,7 @@ class MLPredictor:
         return np.array(ensemble_pred), np.array(ensemble_conf)
     
     def predict(self, features):
-        """Make prediction on new features"""
+        """Make prediction on new features with HOLD logic"""
         if not self.trained_models or features is None:
             return 'HOLD', 0.0
         
@@ -164,8 +164,24 @@ class MLPredictor:
             pred, conf = self._get_ensemble_prediction(features_scaled)
             
             if pred is not None and len(pred) > 0:
-                signal = 'BUY' if pred[0] == 1 else 'SELL'
                 confidence = conf[0] if len(conf) > 0 else 0.5
+                
+                # Determine signal based on prediction AND confidence
+                # Add neutral zone where bot prefers to HOLD
+                if pred[0] == 1:  # Model predicts price will go up
+                    if confidence > config.PREDICTION_THRESHOLD:
+                        signal = 'BUY'
+                    elif confidence > 0.45:  # Moderate confidence - lean towards holding
+                        signal = 'HOLD'
+                    else:
+                        signal = 'HOLD'  # Low confidence - definitely hold
+                else:  # Model predicts price will go down
+                    if confidence > config.PREDICTION_THRESHOLD:
+                        signal = 'SELL'
+                    elif confidence > 0.45:  # Moderate confidence - lean towards holding
+                        signal = 'HOLD'
+                    else:
+                        signal = 'HOLD'  # Low confidence - definitely hold
                 
                 # Create features summary for logging
                 try:
@@ -174,7 +190,7 @@ class MLPredictor:
                     feature_summary = 'Features processed'
                 
                 # Only log predictions above threshold to reduce noise
-                if confidence > config.PREDICTION_THRESHOLD:
+                if signal != 'HOLD' and confidence > config.PREDICTION_THRESHOLD:
                     log_prediction(signal, confidence, feature_summary)
                 
                 return signal, confidence
