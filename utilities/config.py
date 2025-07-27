@@ -10,7 +10,7 @@ from datetime import datetime
 # os.environ['NUMEXPR_MAX_THREADS'] = '16'
 
 class Config:
-    # Trading symbol
+    # SOL trading symbol (fixed)
     SYMBOL = 'SOL/USDT'
     
     # Exchange settings

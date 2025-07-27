@@ -582,7 +582,6 @@ class SOLTrader:
             
             backtest_results = {
                 'config': {
-                    'symbol': config.SYMBOL,
                     'initial_balance': config.INITIAL_BALANCE,
                     'max_position_size': config.MAX_POSITION_SIZE,
                     'stop_loss_pct': config.STOP_LOSS_PCT,
@@ -640,11 +639,8 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='SOL Trading System')
     parser.add_argument('--mode', choices=['backtest', 'paper', 'live'], 
                        default='paper', help='Trading mode')
-    parser.add_argument('--symbol', default='SOL/USDT', help='Trading symbol')
     parser.add_argument('--balance', type=float, default=10000, 
                        help='Initial balance for paper/backtest trading')
-    parser.add_argument('--runs', type=int, default=1,
-                       help='Number of backtest runs to execute')
     parser.add_argument('--threshold', type=float, default=0.55,
                        help='Prediction confidence threshold for trading')
     return parser.parse_args()
@@ -655,17 +651,13 @@ async def main():
     
     # Update config based on arguments
     config.MODE = args.mode
-    config.SYMBOL = args.symbol
     config.INITIAL_BALANCE = args.balance
     config.PREDICTION_THRESHOLD = args.threshold
     
     print("SOL Trading System")
     print(f"Mode: {config.MODE.upper()}")
-    print(f"Symbol: {config.SYMBOL}")
     print(f"Initial Balance: ${config.INITIAL_BALANCE:.2f}")
     print(f"Prediction Threshold: {config.PREDICTION_THRESHOLD}")
-    if config.MODE == 'backtest' and args.runs > 1:
-        print(f"Backtest Runs: {args.runs}")
     print("-" * 40)
     
     if config.MODE in ['paper', 'live'] and not config.BINANCE_API_KEY:
