@@ -148,7 +148,7 @@ class MLPredictor:
         return np.array(ensemble_pred), np.array(ensemble_conf)
     
     def predict(self, features):
-        """Make prediction on new features with HOLD logic"""
+        """Make prediction on new features with enhanced HOLD logic"""
         if not self.trained_models or features is None:
             return 'HOLD', 0.0
         
@@ -165,32 +165,55 @@ class MLPredictor:
             
             if pred is not None and len(pred) > 0:
                 confidence = conf[0] if len(conf) > 0 else 0.5
+                prediction = pred[0]
                 
-                # Determine signal based on prediction AND confidence
-                # Add neutral zone where bot prefers to HOLD
-                if pred[0] == 1:  # Model predicts price will go up
-                    if confidence > config.PREDICTION_THRESHOLD:
+                # Enhanced HOLD logic with multiple thresholds
+                high_threshold = config.PREDICTION_THRESHOLD + 0.1  # Very confident trades
+                medium_threshold = config.PREDICTION_THRESHOLD      # Standard threshold
+                low_threshold = config.PREDICTION_THRESHOLD - 0.1   # Conservative threshold
+                
+                # Determine signal based on prediction AND confidence with multiple zones
+                if prediction == 1:  # Model predicts price will go up
+                    if confidence >= high_threshold:
+                        signal = 'BUY'  # Very confident buy
+                    elif confidence >= medium_threshold:
+                        # Medium confidence - could buy but be more selective
                         signal = 'BUY'
-                    elif confidence > 0.45:  # Moderate confidence - lean towards holding
+                    elif confidence >= low_threshold:
+                        # Low-medium confidence - prefer to hold
                         signal = 'HOLD'
                     else:
-                        signal = 'HOLD'  # Low confidence - definitely hold
-                else:  # Model predicts price will go down
-                    if confidence > config.PREDICTION_THRESHOLD:
+                        # Very low confidence - definitely hold
+                        signal = 'HOLD'
+                else:  # Model predicts price will go down or neutral
+                    if confidence >= high_threshold:
+                        signal = 'SELL'  # Very confident sell
+                    elif confidence >= medium_threshold:
+                        # Medium confidence - could sell but be more selective
                         signal = 'SELL'
-                    elif confidence > 0.45:  # Moderate confidence - lean towards holding
+                    elif confidence >= low_threshold:
+                        # Low-medium confidence - prefer to hold
                         signal = 'HOLD'
                     else:
-                        signal = 'HOLD'  # Low confidence - definitely hold
+                        # Very low confidence - definitely hold
+                        signal = 'HOLD'
                 
-                # Create features summary for logging
-                try:
-                    feature_summary = f'RSI:{features[0][0]:.1f}, MACD:{features[0][1]:.3f}, Vol:{features[0][4]:.2f}'
-                except:
-                    feature_summary = 'Features processed'
+                # Add randomness for more natural holding behavior
+                if signal == 'HOLD' and np.random.random() < 0.1:  # 10% chance to log HOLD
+                    try:
+                        feature_summary = f'RSI:{features[0][0]:.1f}, MACD:{features[0][1]:.3f}, Vol:{features[0][4]:.2f}'
+                    except:
+                        feature_summary = 'Features processed'
+                    
+                    log_prediction(signal, confidence, feature_summary)
                 
-                # Only log predictions above threshold to reduce noise
-                if signal != 'HOLD' and confidence > config.PREDICTION_THRESHOLD:
+                # Only log non-HOLD predictions to reduce noise
+                if signal != 'HOLD':
+                    try:
+                        feature_summary = f'RSI:{features[0][0]:.1f}, MACD:{features[0][1]:.3f}, Vol:{features[0][4]:.2f}'
+                    except:
+                        feature_summary = 'Features processed'
+                    
                     log_prediction(signal, confidence, feature_summary)
                 
                 return signal, confidence
