@@ -23,6 +23,7 @@ class DataManager:
         self.exchange = None
         self.data = pd.DataFrame()
         self.features = pd.DataFrame()
+        self.data_generation_count = 0
         
     async def initialize(self):
         """Initialize exchange connection"""
@@ -65,14 +66,26 @@ class DataManager:
             return False
     
     def load_backtest_data(self, file_path='data/sol_data.csv'):
-        """Load data for backtesting"""
+        """Load data for backtesting with variation"""
         try:
             if os.path.exists(file_path):
+                # Load existing data but add some variation
                 self.data = pd.read_csv(file_path, index_col=0, parse_dates=True)
-                logger.info(f'Loaded {len(self.data)} backtest data points')
+                
+                # Add small random variations to make each run different
+                price_variation = np.random.normal(0, 0.001, len(self.data))  # 0.1% random variation
+                volume_variation = np.random.normal(1, 0.05, len(self.data))   # 5% volume variation
+                
+                self.data['close'] *= (1 + price_variation)
+                self.data['open'] *= (1 + price_variation * 0.8)
+                self.data['high'] *= (1 + np.maximum(price_variation, 0) * 1.2)
+                self.data['low'] *= (1 + np.minimum(price_variation, 0) * 1.2)
+                self.data['volume'] *= np.maximum(volume_variation, 0.1)  # Ensure positive volume
+                
+                logger.info(f'Loaded {len(self.data)} backtest data points with variations')
                 return True
             else:
-                # Generate sample data if file doesn't exist
+                # Generate new sample data
                 self._generate_sample_data()
                 return True
         except Exception as e:
@@ -80,34 +93,88 @@ class DataManager:
             return False
     
     def _generate_sample_data(self):
-        """Generate sample SOL data for backtesting"""
-        np.random.seed(42)
+        """Generate sample SOL data with randomness"""
+        # Reset random seed for this generation to ensure variation
+        generation_seed = int(datetime.now().timestamp() * 1000000) % 2**32 + self.data_generation_count
+        np.random.seed(generation_seed)
+        
+        self.data_generation_count += 1
+        
         dates = pd.date_range(start='2023-01-01', end='2024-01-01', freq='1H')
         
-        # Simulate SOL price movement
-        price = 20.0  # Starting price
+        # Simulate SOL price movement with more randomness
+        base_price = np.random.uniform(15.0, 25.0)  # Random starting price
+        trend_strength = np.random.uniform(-0.00005, 0.00005)  # Random trend
+        volatility_base = np.random.uniform(0.015, 0.025)  # Random base volatility
+        
         prices = []
+        price = base_price
         
         for i in range(len(dates)):
-            # Add trend and volatility
-            trend = 0.0001 * np.sin(i / 100)  # Long-term trend
-            volatility = np.random.normal(0, 0.02)  # Random volatility
-            price *= (1 + trend + volatility)
+            # Add multiple sources of randomness
+            trend = trend_strength * np.sin(i / np.random.uniform(80, 120))  # Random cycle length
+            volatility = volatility_base * (1 + 0.5 * np.sin(i / np.random.uniform(200, 300)))  # Time-varying volatility
+            shock = np.random.normal(0, 0.001) if np.random.random() < 0.05 else 0  # 5% chance of shock
+            daily_drift = np.random.normal(0, 0.0005)  # Daily drift
+            
+            price_change = trend + np.random.normal(0, volatility) + shock + daily_drift
+            price *= (1 + price_change)
+            
+            # Ensure price stays reasonable
+            price = max(5.0, min(100.0, price))
             prices.append(price)
         
-        # Create OHLCV data
+        # Create OHLCV data with realistic relationships
+        opens = prices.copy()
+        closes = prices.copy()
+        
+        highs = []
+        lows = []
+        volumes = []
+        
+        for i, price in enumerate(prices):
+            # Generate high/low with correlation to volatility
+            intraday_vol = np.random.uniform(0.005, 0.03)
+            high = price * (1 + abs(np.random.normal(0, intraday_vol)))
+            low = price * (1 - abs(np.random.normal(0, intraday_vol)))
+            
+            # Ensure OHLC relationships are valid
+            high = max(high, price)
+            low = min(low, price)
+            
+            highs.append(high)
+            lows.append(low)
+            
+            # Generate volume with some correlation to price movement
+            base_volume = np.random.uniform(1000000, 5000000)
+            if i > 0:
+                price_change_impact = abs(price - prices[i-1]) / prices[i-1] * 10
+                volume_multiplier = 1 + price_change_impact
+            else:
+                volume_multiplier = 1
+            
+            volume = base_volume * volume_multiplier * np.random.uniform(0.5, 2.0)
+            volumes.append(volume)
+        
+        # Create DataFrame
         self.data = pd.DataFrame({
-            'open': prices,
-            'high': [p * (1 + abs(np.random.normal(0, 0.01))) for p in prices],
-            'low': [p * (1 - abs(np.random.normal(0, 0.01))) for p in prices],
-            'close': prices,
-            'volume': np.random.uniform(1000000, 10000000, len(dates))
+            'open': opens,
+            'high': highs,
+            'low': lows,
+            'close': closes,
+            'volume': volumes
         }, index=dates)
         
-        # Save for future use
+        # Save for potential reuse
         os.makedirs('data', exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'data/sol_data_{timestamp}.csv'
+        self.data.to_csv(filename)
+        
+        # Also save as default
         self.data.to_csv('data/sol_data.csv')
-        logger.info(f'Generated {len(self.data)} sample data points')
+        
+        logger.info(f'Generated {len(self.data)} sample data points with seed {generation_seed}')
     
     def calculate_technical_indicators(self):
         """Calculate technical indicators for SOL"""
@@ -115,6 +182,10 @@ class DataManager:
             return
         
         df = self.data.copy()
+        
+        # Add small random noise to break deterministic calculations
+        noise_factor = 1e-8
+        df['close'] += np.random.normal(0, noise_factor, len(df))
         
         # Price-based indicators
         df['sma_20'] = df['close'].rolling(20).mean()
@@ -127,12 +198,16 @@ class DataManager:
         df['macd_signal'] = df['macd'].ewm(span=9).mean()
         df['macd_histogram'] = df['macd'] - df['macd_signal']
         
-        # RSI
+        # RSI with slight randomization
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss
         df['rsi'] = 100 - (100 / (1 + rs))
+        
+        # Add small random component to RSI to break exact repetition
+        df['rsi'] += np.random.normal(0, 0.1, len(df))
+        df['rsi'] = np.clip(df['rsi'], 0, 100)
         
         # Bollinger Bands
         df['bb_middle'] = df['close'].rolling(20).mean()
@@ -175,11 +250,6 @@ class DataManager:
         
         self.features = df
         logger.info(f'Calculated technical indicators for {len(self.features)} periods')
-        
-        # Debug: Show available columns
-        logger.info(f'Available feature columns: {list(self.features.columns)}')
-        logger.info(f'First few rows of features:')
-        logger.info(f'{self.features.head(3)}')
     
     def get_latest_features(self):
         """Get latest feature vector for prediction"""
@@ -218,11 +288,13 @@ class DataManager:
         return np.array(features)
     
     def get_training_data(self, lookback=None):
-        """Get training data for ML model - simplified version"""
+        """Get training data for ML model with randomization"""
         if self.features.empty:
             return None, None
         
-        # Use simple features instead of complex lookback
+        # Add randomness to training data selection
+        start_offset = np.random.randint(0, min(20, len(self.features) // 10))
+        
         feature_names = [
             'rsi', 'macd', 'macd_histogram', 'bb_position', 'volume_ratio',
             'price_change_1h', 'price_change_4h', 'price_change_24h',
@@ -232,8 +304,9 @@ class DataManager:
         X = []
         y = []
         
-        # Skip first 50 rows to ensure all indicators are calculated
-        for i in range(50, len(self.features) - 1):
+        # Skip first 50 + offset rows to ensure all indicators are calculated
+        start_idx = 50 + start_offset
+        for i in range(start_idx, len(self.features) - 1):
             current_row = self.features.iloc[i]
             next_row = self.features.iloc[i + 1]
             
@@ -241,13 +314,14 @@ class DataManager:
             features = self._extract_simple_features(current_row)
             X.append(features)
             
-            # Target: price direction in next period
+            # Target: price direction in next period with noise reduction
             current_price = current_row['close']
             next_price = next_row['close']
             price_change = (next_price - current_price) / current_price
             
-            # Binary classification: 1 for up, 0 for down
-            y.append(1 if price_change > 0.001 else 0)  # 0.1% threshold
+            # Binary classification with random threshold variation
+            threshold = np.random.uniform(0.0005, 0.0015)  # 0.05% to 0.15% threshold
+            y.append(1 if price_change > threshold else 0)
         
         if len(X) == 0:
             return None, None
