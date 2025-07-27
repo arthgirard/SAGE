@@ -92,11 +92,11 @@ class SOLTrader:
         self.backtest_run_id = None
         
     def reset_for_new_backtest(self):
-        """Reset all state for a new backtest run"""
+        """Reset trading state but keep the persistent model"""
         # Generate unique run ID
         self.backtest_run_id = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         
-        # Reset trading state
+        # Reset only trading state (NOT the ML model)
         self.balance = config.INITIAL_BALANCE
         self.sol_balance = 0.0
         self.position = None
@@ -108,13 +108,13 @@ class SOLTrader:
         self.signal_history = []
         self.trade_log_count = 0
         
-        # Reset random seeds for this run
+        # Reset random seeds for data variation
         config.reset_randomness()
         
-        # Reset ML predictor
-        ml_predictor.reset_for_new_backtest()
+        # DO NOT reset ML predictor - keep learning across runs
         
-        logger.info(f'SOL Trader reset for new backtest run: {self.backtest_run_id}')
+        logger.info(f'SOL Trader reset for backtest run: {self.backtest_run_id}')
+        logger.info(f'Using persistent model v{ml_predictor.training_count} (best: {ml_predictor.best_performance:.1%})')
         
     async def start(self):
         """Start the SOL trading system"""
@@ -160,20 +160,18 @@ class SOLTrader:
         # Calculate technical indicators
         data_manager.calculate_technical_indicators()
         
-        # Initialize ML predictor
-        if config.MODE != 'backtest':
-            if not ml_predictor.load_models():
-                logger.info('No existing models found, will train new ones')
+        # Initialize persistent ML predictor (always load existing model)
+        ml_predictor.initialize()
         
-        # Train models if needed
+        # Train models if needed (this will improve the existing model)
         await self._train_models_if_needed()
         
         logger.info('System initialization complete')
     
     async def _train_models_if_needed(self):
-        """Train ML models if needed"""
+        """Train ML models if needed (continuous learning)"""
         if ml_predictor.should_retrain() or not ml_predictor.trained_models:
-            logger.info('Training ML models...')
+            logger.info('Training/improving persistent model...')
             
             X, y = data_manager.get_training_data()
             if X is not None and len(X) > 100:
@@ -181,9 +179,13 @@ class SOLTrader:
                 if success:
                     self.last_model_training = datetime.now()
                     ml_predictor.analyze_feature_importance()
-                    logger.info('ML models trained successfully')
+                    
+                    # Log learning progress
+                    progress = ml_predictor.get_learning_progress()
+                    logger.info('Model training completed successfully')
+                    logger.info(progress)
                 else:
-                    logger.error('Failed to train ML models')
+                    logger.error('Failed to train models')
             else:
                 logger.warning('Insufficient data for ML training')
     
@@ -491,6 +493,7 @@ class SOLTrader:
         print(f"SOL TRADING SYSTEM - BACKTEST #{self.backtest_run_id}")
         print("="*70)
         print(f"Random Seed: {config.random_seed}")
+        print(f"Model Version: v{ml_predictor.training_count} (Best: {ml_predictor.best_performance:.1%})")
         print(f"Period: {start_date} to {end_date}")
         print(f"Initial Balance: ${initial_balance:,.2f}")
         print(f"Final Balance: ${self.balance:,.2f}")
