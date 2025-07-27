@@ -59,13 +59,23 @@ def extract_features(data, index):
     except:
         return None
 
+def serialize_datetime(obj):
+    """Convert datetime objects to ISO format strings"""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    elif isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    elif isinstance(obj, np.datetime64):
+        return pd.Timestamp(obj).isoformat()
+    return obj
+
 class SOLTrader:
     """Main SOL trading system with ML integration"""
     
     def __init__(self):
         self.running = False
         self.last_model_training = None
-        self.performance_log_interval = 300  # 5 minutes
+        self.performance_log_interval = 300
         self.last_performance_log = datetime.now()
         
         # Trading state
@@ -79,11 +89,41 @@ class SOLTrader:
         # Enhanced tracking
         self.signal_history = []
         self.trade_log_count = 0
+        self.backtest_run_id = None
+        
+    def reset_for_new_backtest(self):
+        """Reset all state for a new backtest run"""
+        # Generate unique run ID
+        self.backtest_run_id = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        
+        # Reset trading state
+        self.balance = config.INITIAL_BALANCE
+        self.sol_balance = 0.0
+        self.position = None
+        self.trades = []
+        self.max_balance = config.INITIAL_BALANCE
+        self.max_drawdown = 0.0
+        
+        # Reset tracking
+        self.signal_history = []
+        self.trade_log_count = 0
+        
+        # Reset random seeds for this run
+        config.reset_randomness()
+        
+        # Reset ML predictor
+        ml_predictor.reset_for_new_backtest()
+        
+        logger.info(f'SOL Trader reset for new backtest run: {self.backtest_run_id}')
         
     async def start(self):
         """Start the SOL trading system"""
         try:
             logger.info(f'Starting SOL Trader in {config.MODE} mode')
+            
+            # Reset state for new run
+            if config.MODE == 'backtest':
+                self.reset_for_new_backtest()
             
             # Initialize components
             await self._initialize_system()
@@ -121,8 +161,9 @@ class SOLTrader:
         data_manager.calculate_technical_indicators()
         
         # Initialize ML predictor
-        if not ml_predictor.load_models():
-            logger.info('No existing models found, will train new ones')
+        if config.MODE != 'backtest':
+            if not ml_predictor.load_models():
+                logger.info('No existing models found, will train new ones')
         
         # Train models if needed
         await self._train_models_if_needed()
@@ -147,13 +188,15 @@ class SOLTrader:
                 logger.warning('Insufficient data for ML training')
     
     async def _run_backtest(self):
-        """Run backtesting mode with enhanced logging"""
-        logger.info('Running complete backtest on SOL data')
+        """Run backtesting mode"""
+        logger.info(f'Running backtest #{self.backtest_run_id} on SOL data')
         
         data = data_manager.features
         start_idx = config.LOOKBACK_PERIODS
         
         logger.info(f'Backtesting from index {start_idx} to {len(data)} ({len(data) - start_idx} periods)')
+        logger.info(f'Random seed: {config.random_seed}')
+        logger.info(f'Prediction threshold: {config.PREDICTION_THRESHOLD}')
         
         # Stats tracking
         total_predictions = 0
@@ -166,6 +209,8 @@ class SOLTrader:
         sell_attempts = 0
         holds_while_in_position = 0
         holds_while_no_position = 0
+        above_threshold_buy = 0
+        above_threshold_sell = 0
         
         # Backtest loop
         for i in range(start_idx, len(data)):
@@ -184,12 +229,16 @@ class SOLTrader:
                 # Track signal distribution
                 if signal == 'BUY':
                     buy_signals += 1
-                    if self.position is None and confidence > config.PREDICTION_THRESHOLD:
-                        buy_attempts += 1
+                    if confidence > config.PREDICTION_THRESHOLD:
+                        above_threshold_buy += 1
+                        if self.position is None:
+                            buy_attempts += 1
                 elif signal == 'SELL':
                     sell_signals += 1
-                    if self.position is not None and confidence > config.PREDICTION_THRESHOLD:
-                        sell_attempts += 1
+                    if confidence > config.PREDICTION_THRESHOLD:
+                        above_threshold_sell += 1
+                        if self.position is not None:
+                            sell_attempts += 1
                 else:  # HOLD
                     hold_signals += 1
                     if self.position is not None:
@@ -203,21 +252,23 @@ class SOLTrader:
                     'signal': signal,
                     'confidence': confidence,
                     'price': current_price,
-                    'has_position': self.position is not None
+                    'has_position': self.position is not None,
+                    'above_threshold': confidence > config.PREDICTION_THRESHOLD
                 })
                 
-                # Execute trading logic with enhanced logging
+                # Execute trading logic
                 executed = await self._process_signal_with_logging(signal, confidence, current_price, data.index[i], i)
                 
             except Exception as e:
                 logger.error(f'Error at index {i}: {e}')
             
-            # Progress logging with signal stats
+            # Progress logging
             if i % 1000 == 0:
                 progress = (i - start_idx) / (len(data) - start_idx) * 100
                 portfolio_value = self.balance + (self.sol_balance * current_price)
                 logger.info(f'Progress: {progress:.1f}% | Portfolio: ${portfolio_value:.2f} | Trades: {len(self.trades)}')
                 logger.info(f'Signals - BUY:{buy_signals} SELL:{sell_signals} HOLD:{hold_signals}')
+                logger.info(f'Above threshold - BUY:{above_threshold_buy} SELL:{above_threshold_sell}')
                 logger.info(f'Actions - Buy attempts:{buy_attempts} Sell attempts:{sell_attempts}')
         
         # Close final position
@@ -228,7 +279,8 @@ class SOLTrader:
         # Calculate and display results
         await self._display_backtest_results(
             total_predictions, buy_signals, sell_signals, hold_signals,
-            buy_attempts, sell_attempts, holds_while_in_position, holds_while_no_position
+            buy_attempts, sell_attempts, holds_while_in_position, holds_while_no_position,
+            above_threshold_buy, above_threshold_sell
         )
     
     async def _process_signal_with_logging(self, signal, confidence, current_price, timestamp, index):
@@ -236,55 +288,48 @@ class SOLTrader:
         
         # Log every 100th signal to track activity
         if index % 100 == 0 or len(self.trades) < 50:
-            logger.info(f'Index {index}: {signal} conf:{confidence:.3f} price:${current_price:.4f} pos:{self.position is not None}')
+            logger.info(f'Index {index}: {signal} conf:{confidence:.3f} price:${current_price:.4f} pos:{self.position is not None} thresh:{config.PREDICTION_THRESHOLD}')
         
-        # HOLD signal logic with improved thresholds
+        # HOLD signal logic
         if signal == 'HOLD':
             return False
         
-        # Enhanced confidence thresholds for more selective trading
+        # Use original prediction threshold
         min_confidence = config.PREDICTION_THRESHOLD
         
-        # BUY signal - only if no position and confidence is high enough
+        # BUY signal
         if signal == 'BUY':
             if self.position is not None:
-                # Already have position - log hold decision
-                if index % 500 == 0:  # Log occasionally
+                if index % 500 == 0:
                     logger.info(f'BUY signal ignored - already in position at ${current_price:.4f}')
                 return False
             
             if confidence <= min_confidence:
-                # Confidence too low - log hold decision
-                if index % 500 == 0:  # Log occasionally
-                    logger.info(f'BUY signal ignored - low confidence {confidence:.3f} < {min_confidence}')
+                if index % 500 == 0:
+                    logger.info(f'BUY signal ignored - low confidence {confidence:.3f} <= {min_confidence}')
                 return False
             
-            # Execute buy
             return await self._execute_buy(current_price, confidence, timestamp)
         
-        # SELL signal - only if we have a position and confidence is high enough  
+        # SELL signal
         if signal == 'SELL':
             if self.position is None:
-                # No position to sell - log hold decision
-                if index % 500 == 0:  # Log occasionally
+                if index % 500 == 0:
                     logger.info(f'SELL signal ignored - no position at ${current_price:.4f}')
                 return False
             
             if confidence <= min_confidence:
-                # Confidence too low - log hold decision
-                if index % 500 == 0:  # Log occasionally
-                    logger.info(f'SELL signal ignored - low confidence {confidence:.3f} < {min_confidence}')
+                if index % 500 == 0:
+                    logger.info(f'SELL signal ignored - low confidence {confidence:.3f} <= {min_confidence}')
                 return False
             
-            # Execute sell
             return await self._execute_sell(current_price, confidence, timestamp, "SELL_SIGNAL")
         
-        # Check stop loss/take profit regardless of signal
+        # Check stop loss/take profit
         if self.position is not None:
             should_sell = False
             sell_reason = ""
             
-            # Check stop loss/take profit
             if current_price <= self.position['stop_loss']:
                 should_sell = True
                 sell_reason = "STOP_LOSS"
@@ -298,45 +343,8 @@ class SOLTrader:
         
         return False
     
-    async def _process_signal(self, signal, confidence, current_price, timestamp):
-        """Original process signal method for live trading"""
-        
-        # HOLD signal - maintain current position
-        if signal == 'HOLD':
-            return False
-        
-        # BUY signal - only if no position and confidence is high enough
-        if signal == 'BUY' and confidence > config.PREDICTION_THRESHOLD:
-            if self.position is None:
-                return await self._execute_buy(current_price, confidence, timestamp)
-            return False
-        
-        # SELL signal - only if we have a position and confidence is high enough  
-        if signal == 'SELL' and confidence > config.PREDICTION_THRESHOLD:
-            if self.position is not None:
-                return await self._execute_sell(current_price, confidence, timestamp, "SELL_SIGNAL")
-            return False
-        
-        # Check stop loss/take profit regardless of signal
-        if self.position is not None:
-            should_sell = False
-            sell_reason = ""
-            
-            # Check stop loss/take profit
-            if current_price <= self.position['stop_loss']:
-                should_sell = True
-                sell_reason = "STOP_LOSS"
-            elif current_price >= self.position['take_profit']:
-                should_sell = True
-                sell_reason = "TAKE_PROFIT"
-            
-            if should_sell:
-                return await self._execute_sell(current_price, confidence, timestamp, sell_reason)
-        
-        return False
-    
     async def _execute_buy(self, price, confidence, timestamp):
-        """Execute buy order with continuous logging"""
+        """Execute buy order"""
         try:
             # Calculate position size
             risk_amount = self.balance * config.MAX_POSITION_SIZE * confidence
@@ -359,18 +367,21 @@ class SOLTrader:
                     'take_profit': take_profit
                 }
                 
+                # Convert timestamp to string
+                timestamp_str = serialize_datetime(timestamp)
+                
                 self.trades.append({
-                    'timestamp': timestamp,
+                    'timestamp': timestamp_str,
                     'action': 'BUY',
                     'price': price,
                     'amount': amount,
                     'balance': self.balance,
-                    'confidence': confidence
+                    'confidence': confidence,
+                    'run_id': self.backtest_run_id
                 })
                 
                 self.trade_log_count += 1
                 
-                # Log every trade (not just first 20)
                 logger.info(f'BUY #{self.trade_log_count}: ${price:.4f} | Amount: {amount:.4f} SOL | Confidence: {confidence:.3f} | Balance: ${self.balance:.2f}')
                 
                 return True
@@ -381,7 +392,7 @@ class SOLTrader:
         return False
     
     async def _execute_sell(self, price, confidence, timestamp, reason="SELL_SIGNAL"):
-        """Execute sell order with continuous logging"""
+        """Execute sell order"""
         try:
             if not self.position:
                 return False
@@ -403,20 +414,23 @@ class SOLTrader:
             if current_drawdown > self.max_drawdown:
                 self.max_drawdown = current_drawdown
             
+            # Convert timestamp to string
+            timestamp_str = serialize_datetime(timestamp)
+            
             self.trades.append({
-                'timestamp': timestamp,
+                'timestamp': timestamp_str,
                 'action': 'SELL',
                 'price': price,
                 'amount': amount,
                 'balance': self.balance,
                 'confidence': confidence,
                 'pnl': pnl,
-                'reason': reason
+                'reason': reason,
+                'run_id': self.backtest_run_id
             })
             
             self.trade_log_count += 1
             
-            # Log every trade (not just first 40)
             logger.info(f'SELL #{self.trade_log_count}: ${price:.4f} | PnL: ${pnl:.2f} | Reason: {reason} | Balance: ${self.balance:.2f}')
             
             self.position = None
@@ -428,7 +442,8 @@ class SOLTrader:
         return False
     
     async def _display_backtest_results(self, total_predictions, buy_signals, sell_signals, hold_signals,
-                                       buy_attempts, sell_attempts, holds_while_in_position, holds_while_no_position):
+                                       buy_attempts, sell_attempts, holds_while_in_position, holds_while_no_position,
+                                       above_threshold_buy, above_threshold_sell):
         """Display comprehensive backtest results"""
         
         # Calculate metrics
@@ -446,20 +461,18 @@ class SOLTrader:
         
         # Calculate average holding time
         holding_times = []
-        for i in range(0, len(self.trades), 2):  # Buy/Sell pairs
+        for i in range(0, len(self.trades), 2):
             if i + 1 < len(self.trades):
-                buy_time = self.trades[i]['timestamp']
-                sell_time = self.trades[i + 1]['timestamp']
-                if isinstance(buy_time, str):
-                    buy_time = datetime.fromisoformat(buy_time)
-                if isinstance(sell_time, str):
-                    sell_time = datetime.fromisoformat(sell_time)
-                holding_time = (sell_time - buy_time).total_seconds() / 3600  # hours
+                buy_time_str = self.trades[i]['timestamp']
+                sell_time_str = self.trades[i + 1]['timestamp']
+                buy_time = datetime.fromisoformat(buy_time_str)
+                sell_time = datetime.fromisoformat(sell_time_str)
+                holding_time = (sell_time - buy_time).total_seconds() / 3600
                 holding_times.append(holding_time)
         
         avg_holding_time = np.mean(holding_times) if holding_times else 0
         
-        # Calculate Sharpe ratio (simplified)
+        # Calculate Sharpe ratio
         if len(self.trades) > 1:
             returns = [t.get('pnl', 0) / initial_balance for t in self.trades if 'pnl' in t]
             if returns:
@@ -471,17 +484,13 @@ class SOLTrader:
         else:
             sharpe_ratio = 0
         
-        # Analyze signal effectiveness
-        high_conf_buy = sum(1 for s in self.signal_history if s['signal'] == 'BUY' and s['confidence'] > config.PREDICTION_THRESHOLD)
-        high_conf_sell = sum(1 for s in self.signal_history if s['signal'] == 'SELL' and s['confidence'] > config.PREDICTION_THRESHOLD)
-        high_conf_hold = sum(1 for s in self.signal_history if s['signal'] == 'HOLD' and s['confidence'] > config.PREDICTION_THRESHOLD)
-        
         start_date = data_manager.features.index[0].strftime('%Y-%m-%d')
         end_date = data_manager.features.index[-1].strftime('%Y-%m-%d')
         
         print("\n" + "="*70)
-        print("SOL TRADING SYSTEM - COMPREHENSIVE BACKTEST RESULTS")
+        print(f"SOL TRADING SYSTEM - BACKTEST #{self.backtest_run_id}")
         print("="*70)
+        print(f"Random Seed: {config.random_seed}")
         print(f"Period: {start_date} to {end_date}")
         print(f"Initial Balance: ${initial_balance:,.2f}")
         print(f"Final Balance: ${self.balance:,.2f}")
@@ -495,9 +504,9 @@ class SOLTrader:
         print(f"BUY Signals: {buy_signals:,} ({buy_signals/total_predictions:.1%})")
         print(f"SELL Signals: {sell_signals:,} ({sell_signals/total_predictions:.1%})")
         print(f"HOLD Signals: {hold_signals:,} ({hold_signals/total_predictions:.1%})")
-        print(f"High Confidence BUY: {high_conf_buy:,}")
-        print(f"High Confidence SELL: {high_conf_sell:,}")
-        print(f"High Confidence HOLD: {high_conf_hold:,}")
+        print(f"Above Threshold BUY: {above_threshold_buy:,}")
+        print(f"Above Threshold SELL: {above_threshold_sell:,}")
+        print(f"Prediction Threshold: {config.PREDICTION_THRESHOLD}")
         print("-" * 70)
         print("TRADING BEHAVIOR:")
         print(f"Buy Attempts: {buy_attempts}")
@@ -513,7 +522,6 @@ class SOLTrader:
         print(f"Average Holding Time: {avg_holding_time:.1f} hours")
         print(f"Max Drawdown: {self.max_drawdown:.1%}")
         print(f"Sharpe Ratio: {sharpe_ratio:.2f}")
-        print(f"Prediction Threshold Used: {config.PREDICTION_THRESHOLD}")
         print("="*70)
         
         # Log final performance
@@ -521,6 +529,8 @@ class SOLTrader:
         
         # Save results
         await self._save_backtest_results({
+            'run_id': self.backtest_run_id,
+            'random_seed': config.random_seed,
             'total_trades': len(self.trades),
             'win_rate': win_rate,
             'total_return': total_return,
@@ -538,109 +548,37 @@ class SOLTrader:
                 'sell_attempts': sell_attempts,
                 'holds_while_in_position': holds_while_in_position,
                 'holds_while_no_position': holds_while_no_position,
-                'high_conf_buy': high_conf_buy,
-                'high_conf_sell': high_conf_sell,
-                'high_conf_hold': high_conf_hold
+                'above_threshold_buy': above_threshold_buy,
+                'above_threshold_sell': above_threshold_sell
             },
             'avg_holding_time_hours': avg_holding_time
         })
-    
-    async def _run_live_trading(self):
-        """Run live/paper trading mode"""
-        logger.info(f'Starting {config.MODE} trading loop')
-        self.running = True
-        
-        loop_count = 0
-        
-        while self.running:
-            try:
-                loop_start = datetime.now()
-                
-                # Update market data (for non-backtest modes)
-                await self._update_market_data()
-                
-                # Retrain models periodically
-                if ml_predictor.should_retrain():
-                    await self._train_models_if_needed()
-                
-                # Get current price
-                current_price = await data_manager.get_current_price()
-                if current_price is None:
-                    logger.warning('Failed to get current price')
-                    await asyncio.sleep(30)
-                    continue
-                
-                # Get ML prediction
-                features = data_manager.get_latest_features()
-                if features is not None:
-                    features_reshaped = features.reshape(1, -1) if features.ndim == 1 else features
-                    signal, confidence = ml_predictor.predict(features_reshaped)
-                    
-                    # Execute signal
-                    if signal != 'HOLD':
-                        await self._process_signal(signal, confidence, current_price, datetime.now())
-                
-                # Log performance periodically
-                if (datetime.now() - self.last_performance_log).seconds >= self.performance_log_interval:
-                    await self._log_performance(current_price)
-                    self.last_performance_log = datetime.now()
-                
-                loop_count += 1
-                
-                # Sleep between iterations
-                loop_duration = (datetime.now() - loop_start).total_seconds()
-                sleep_time = max(0, 60 - loop_duration)  # 1-minute intervals
-                await asyncio.sleep(sleep_time)
-                
-            except Exception as e:
-                logger.error(f'Error in trading loop: {e}')
-                await asyncio.sleep(30)
-    
-    async def _update_market_data(self):
-        """Update market data for live/paper trading"""
-        try:
-            # Fetch recent data
-            if await data_manager.fetch_historical_data(days_back=2):
-                data_manager.calculate_technical_indicators()
-            
-        except Exception as e:
-            logger.error(f'Failed to update market data: {e}')
-    
-    async def _log_performance(self, current_price: float):
-        """Log current performance"""
-        try:
-            portfolio_value = self.balance + (self.sol_balance * current_price)
-            
-            profitable_trades = sum(1 for t in self.trades if t.get('pnl', 0) > 0)
-            total_executed_trades = len([t for t in self.trades if 'pnl' in t])
-            win_rate = profitable_trades / total_executed_trades if total_executed_trades > 0 else 0
-            total_pnl = sum(t.get('pnl', 0) for t in self.trades)
-            
-            log_performance(len(self.trades), win_rate, total_pnl, self.max_drawdown)
-            
-            logger.info(f'Portfolio Value: ${portfolio_value:.2f} | SOL Price: ${current_price:.4f}')
-            
-            # Log ML model performance
-            ml_performance = ml_predictor.get_model_performance()
-            if ml_performance:
-                logger.info(f'Model Accuracy: {ml_performance["average_accuracy"]:.3f} | '
-                           f'Trainings: {ml_performance["training_count"]}')
-            
-        except Exception as e:
-            logger.error(f'Error logging performance: {e}')
     
     async def _save_backtest_results(self, results):
         """Save backtest results to file"""
         try:
             os.makedirs('results', exist_ok=True)
             
-            # Add trades data
+            # Prepare trades data
             trades_data = []
             for trade in self.trades:
-                trade_dict = dict(trade)
-                if 'timestamp' in trade_dict:
-                    trade_dict['timestamp'] = trade_dict['timestamp'].isoformat()
+                trade_dict = {}
+                for key, value in trade.items():
+                    trade_dict[key] = serialize_datetime(value)
                 trades_data.append(trade_dict)
+            
+            # Prepare signal history
+            signal_data = []
+            for signal in self.signal_history[-1000:]:
+                signal_dict = {}
+                for key, value in signal.items():
+                    signal_dict[key] = serialize_datetime(value)
+                signal_data.append(signal_dict)
+            
+            # Get ML performance
+            ml_performance = ml_predictor.get_model_performance()
+            if ml_performance and 'last_training' in ml_performance:
+                ml_performance['last_training'] = serialize_datetime(ml_performance['last_training'])
             
             backtest_results = {
                 'config': {
@@ -653,14 +591,14 @@ class SOLTrader:
                 },
                 'results': results,
                 'trades': trades_data,
-                'signal_history': self.signal_history[-1000:]  # Save last 1000 signals for analysis
+                'signal_history': signal_data,
+                'ml_performance': ml_performance
             }
             
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f'results/sol_backtest_{timestamp}.json'
+            filename = f'results/sol_backtest_{self.backtest_run_id}.json'
             
             with open(filename, 'w') as f:
-                json.dump(backtest_results, f, indent=2)
+                json.dump(backtest_results, f, indent=2, default=str)
             
             logger.info(f'Backtest results saved to {filename}')
             
@@ -705,6 +643,10 @@ def parse_arguments():
     parser.add_argument('--symbol', default='SOL/USDT', help='Trading symbol')
     parser.add_argument('--balance', type=float, default=10000, 
                        help='Initial balance for paper/backtest trading')
+    parser.add_argument('--runs', type=int, default=1,
+                       help='Number of backtest runs to execute')
+    parser.add_argument('--threshold', type=float, default=0.55,
+                       help='Prediction confidence threshold for trading')
     return parser.parse_args()
 
 async def main():
@@ -715,11 +657,15 @@ async def main():
     config.MODE = args.mode
     config.SYMBOL = args.symbol
     config.INITIAL_BALANCE = args.balance
+    config.PREDICTION_THRESHOLD = args.threshold
     
     print("SOL Trading System")
     print(f"Mode: {config.MODE.upper()}")
     print(f"Symbol: {config.SYMBOL}")
     print(f"Initial Balance: ${config.INITIAL_BALANCE:.2f}")
+    print(f"Prediction Threshold: {config.PREDICTION_THRESHOLD}")
+    if config.MODE == 'backtest' and args.runs > 1:
+        print(f"Backtest Runs: {args.runs}")
     print("-" * 40)
     
     if config.MODE in ['paper', 'live'] and not config.BINANCE_API_KEY:
@@ -727,6 +673,7 @@ async def main():
         print("For testnet keys, visit: https://testnet.binance.vision/")
         return
     
+    # Single run
     trader = SOLTrader()
     
     try:
